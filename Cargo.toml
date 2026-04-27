@@ -1,0 +1,25 @@
+[package]
+name = "ollama-classifier-rs"
+version = "0.1.0"
+edition = "2021"
+description = "A backend-agnostic text classifier for LLMs via OpenAI-compatible API (vLLM, SGLang, llama.cpp)"
+license = "MIT"
+repository = "https://github.com/paluigi-moltis/ollama-classifier-rs"
+readme = "README.md"
+keywords = ["llm", "classification", "ollama", "vllm", "sglang"]
+categories = ["text-processing", "science"]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+
+[features]
+default = []
+async-runtime = ["tokio"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
