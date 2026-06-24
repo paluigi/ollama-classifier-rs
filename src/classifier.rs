@@ -172,15 +172,14 @@ impl<B: LLMBackend> LLMClassifier<B> {
     }
 
     // =========================================================================
-    // Sync Methods — Score (Multi-call evaluation with softmax)
+    // Sync Methods — Classify
     // =========================================================================
 
-    /// Score a classification using multi-call evaluation with softmax.
+    /// Classify text with calibrated confidence scores.
     ///
-    /// Makes separate API calls for each choice to compute
-    /// log P(choice|context), then applies softmax for calibrated
-    /// probabilities. This makes N API calls for N choices.
-    pub fn score(
+    /// Uses multi-call evaluation to compute calibrated probabilities
+    /// for each choice. Makes N API calls for N choices.
+    pub fn classify(
         &self,
         text: &str,
         choices: impl Into<Choices>,
@@ -213,36 +212,6 @@ impl<B: LLMBackend> LLMClassifier<B> {
         ))
     }
 
-    /// Score multiple texts using multi-call method.
-    pub fn batch_score(
-        &self,
-        texts: &[&str],
-        choices: impl Into<Choices> + Clone,
-        system_prompt: Option<&str>,
-    ) -> Result<Vec<ClassificationResult>> {
-        texts
-            .iter()
-            .map(|text| self.score(text, choices.clone().into(), system_prompt))
-            .collect()
-    }
-
-    // =========================================================================
-    // Sync Methods — Classify
-    // =========================================================================
-
-    /// Classify text with calibrated confidence scores.
-    ///
-    /// Uses multi-call evaluation to compute calibrated probabilities
-    /// for each choice. Makes N API calls for N choices.
-    pub fn classify(
-        &self,
-        text: &str,
-        choices: impl Into<Choices>,
-        system_prompt: Option<&str>,
-    ) -> Result<ClassificationResult> {
-        self.score(text, choices, system_prompt)
-    }
-
     /// Classify multiple texts with calibrated confidence scores.
     pub fn batch_classify(
         &self,
@@ -250,7 +219,10 @@ impl<B: LLMBackend> LLMClassifier<B> {
         choices: impl Into<Choices> + Clone,
         system_prompt: Option<&str>,
     ) -> Result<Vec<ClassificationResult>> {
-        self.batch_score(texts, choices, system_prompt)
+        texts
+            .iter()
+            .map(|text| self.classify(text, choices.clone().into(), system_prompt))
+            .collect()
     }
 
     // =========================================================================
@@ -297,11 +269,11 @@ impl<B: LLMBackend> LLMClassifier<B> {
     }
 
     // =========================================================================
-    // Async Methods — Score
+    // Async Methods — Classify
     // =========================================================================
 
-    /// Async version of [`score`](LLMClassifier::score).
-    pub async fn ascore(
+    /// Async version of [`classify`](LLMClassifier::classify).
+    pub async fn aclassify(
         &self,
         text: &str,
         choices: impl Into<Choices>,
@@ -332,8 +304,8 @@ impl<B: LLMBackend> LLMClassifier<B> {
         ))
     }
 
-    /// Async version of [`batch_score`](LLMClassifier::batch_score).
-    pub async fn abatch_score(
+    /// Async version of [`batch_classify`](LLMClassifier::batch_classify).
+    pub async fn abatch_classify(
         &self,
         texts: &[&str],
         choices: impl Into<Choices> + Clone,
@@ -342,35 +314,11 @@ impl<B: LLMBackend> LLMClassifier<B> {
         let mut results = Vec::new();
         for text in texts {
             results.push(
-                self.ascore(text, choices.clone().into(), system_prompt)
+                self.aclassify(text, choices.clone().into(), system_prompt)
                     .await?,
             );
         }
         Ok(results)
-    }
-
-    // =========================================================================
-    // Async Methods — Classify
-    // =========================================================================
-
-    /// Async version of [`classify`](LLMClassifier::classify).
-    pub async fn aclassify(
-        &self,
-        text: &str,
-        choices: impl Into<Choices>,
-        system_prompt: Option<&str>,
-    ) -> Result<ClassificationResult> {
-        self.ascore(text, choices, system_prompt).await
-    }
-
-    /// Async version of [`batch_classify`](LLMClassifier::batch_classify).
-    pub async fn abatch_classify(
-        &self,
-        texts: &[&str],
-        choices: impl Into<Choices> + Clone,
-        system_prompt: Option<&str>,
-    ) -> Result<Vec<ClassificationResult>> {
-        self.abatch_score(texts, choices, system_prompt).await
     }
 
     // =========================================================================

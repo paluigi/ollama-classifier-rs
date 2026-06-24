@@ -33,8 +33,8 @@
 //!
 //! - **`generate`** — Fast single-call classification using JSON schema constraints.
 //!   Returns only the predicted label, no confidence scores.
-//! - **`classify` / `score`** — Multi-call evaluation with softmax-calibrated
-//!   probabilities. Makes N API calls for N choices but provides confidence scores.
+//! - **`classify`** — Multi-call evaluation with softmax-calibrated
+//!   probabilities. Makes N API calls for N choices and provides confidence scores.
 //! - **`batch_*`** — Process multiple texts sequentially.
 //! - **`a*`** — Async versions of all methods (requires `tokio` runtime).
 

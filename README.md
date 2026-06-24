@@ -119,7 +119,7 @@ async fn main() -> ollama_classifier_rs::Result<()> {
 | Method | Calls | Description |
 |--------|-------|-------------|
 | `generate` | 1 | Fast single-call with JSON schema constraint. Returns only the label. |
-| `classify` / `score` | N | Multi-call with softmax-calibrated probabilities. N calls for N choices. |
+| `classify` | N | Multi-call with softmax-calibrated probabilities. N calls for N choices. |
 | `batch_*` | N or N×C | Process multiple texts sequentially. |
 | `a*` (async) | Same | Async versions of all methods. Requires a Tokio runtime. |
 
