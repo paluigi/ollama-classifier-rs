@@ -1,50 +1,36 @@
 //! # ollama-classifier-rs
 //!
-//! A Rust port of the Python `ollama-classifier` library — a backend-agnostic
-//! text classifier that delegates inference to any LLM server via the
-//! OpenAI-compatible chat completions API.
+//! A Rust port of the Python [`ollama-classifier`](https://github.com/paluigi/ollama-classifier)
+//! library — a backend-agnostic text classifier that delegates inference to any
+//! LLM server and produces calibrated confidence scores.
 //!
 //! ## Supported Backends
 //!
-//! - **vLLM** — high-throughput serving engine
-//! - **SGLang** — fast structured generation serving
-//! - **llama.cpp** — lightweight local inference via `llama-server`
-//!
-//! ## Quick Start
-//!
-//! ```no_run
-//! use ollama_classifier_rs::backends::VLLMBackend;
-//! use ollama_classifier_rs::LLMClassifier;
-//!
-//! let backend = VLLMBackend::new("meta-llama/Llama-3.2-3B-Instruct");
-//! let classifier = LLMClassifier::new(backend);
-//!
-//! let result = classifier.classify(
-//!     "I love this product!",
-//!     vec!["positive", "negative", "neutral"],
-//!     None,
-//! ).unwrap();
-//!
-//! println!("Prediction: {}", result.prediction);
-//! println!("Confidence: {:.2}%", result.confidence * 100.0);
-//! ```
+//! - **Ollama** — native Ollama API (`/api/chat`, `/api/generate`, `/api/tokenize`)
+//! - **vLLM** — OpenAI-compatible, `guided_choice` constraints
+//! - **SGLang** — OpenAI-compatible, `regex` constraints
+//! - **llama.cpp** — OpenAI-compatible, GBNF `grammar` constraints
 //!
 //! ## Classification Methods
 //!
-//! - **`generate`** — Fast single-call classification using JSON schema constraints.
-//!   Returns only the predicted label, no confidence scores.
-//! - **`classify`** — Multi-call evaluation with softmax-calibrated
-//!   probabilities. Makes N API calls for N choices and provides confidence scores.
-//! - **`batch_*`** — Process multiple texts sequentially.
-//! - **`a*`** — Async versions of all methods (requires `tokio` runtime).
+//! - **[`classify`][crate::LLMClassifier::classify]** — multi-call completion
+//!   scoring. Makes one backend call per label and normalizes the
+//!   geometric-mean logprobs with a stable softmax. Exact, N calls for N labels.
+//! - **[`generate`][crate::LLMClassifier::generate]** — adaptive
+//!   constrained-generation scoring. Tokenizes labels, builds a trie, and
+//!   resolves ambiguity with a bounded number of constrained calls controlled
+//!   by `max_calls` (`1` = single fast approximate call, `None` = fully exact).
+//!
+//! Sync, async (`a*`), and batch (`batch_*` / `abatch_*`) variants are provided.
 
 pub mod backends;
 pub mod classifier;
 pub mod prompts;
+pub mod scoring;
 pub mod types;
 
 pub use classifier::LLMClassifier;
-pub use types::{Choices, ClassificationResult};
+pub use types::{Choices, ChoicesType, ClassificationResult};
 
 // Re-export anyhow::Result as the crate-level error type for convenience.
 pub use anyhow::Result;

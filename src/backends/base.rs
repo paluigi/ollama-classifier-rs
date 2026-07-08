@@ -1,4 +1,8 @@
 //! Base backend trait and shared types for inference engines.
+//!
+//! All OpenAI-compatible backends (vLLM, SGLang, llama.cpp) share the helpers
+//! in this module. The Ollama backend speaks its own native protocol and only
+//! implements the [`LLMBackend`] trait.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -25,24 +29,41 @@ impl ChatMessage {
     }
 }
 
-/// A single top-logprob entry.
+/// A tokenizer token (text + id).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TopLogProb {
-    /// Token string.
-    pub token: String,
-    /// Log probability.
-    pub logprob: f64,
+pub struct Token {
+    /// Token text.
+    pub text: String,
+    /// Token id.
+    pub id: i64,
 }
 
-/// Logprob info for a single token.
+/// Logprob info for a single generated/scored token position.
+///
+/// `top_logprobs` is flattened into a `{token: logprob}` map, matching the
+/// shape the scoring functions consume.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenLogProb {
-    /// The token.
+pub struct TokenLogprob {
+    /// The token string.
     pub token: String,
+    /// Token id (when reported by the server, otherwise `-1`).
+    pub token_id: i64,
     /// Log probability of this token.
     pub logprob: f64,
-    /// Top log probabilities for this token position.
-    pub top_logprobs: Vec<TopLogProb>,
+    /// Candidate tokens and their logprobs at this position.
+    pub top_logprobs: HashMap<String, f64>,
+}
+
+impl TokenLogprob {
+    /// Create a new token-logprob entry with empty top-logprobs.
+    pub fn new(token: impl Into<String>, logprob: f64) -> Self {
+        Self {
+            token: token.into(),
+            token_id: -1,
+            logprob,
+            top_logprobs: HashMap::new(),
+        }
+    }
 }
 
 /// Response from a chat completion call.
@@ -50,16 +71,31 @@ pub struct TokenLogProb {
 pub struct ChatResponse {
     /// The generated content.
     pub content: String,
+    /// The label extracted from the (possibly JSON-wrapped) content.
+    pub label: String,
     /// Log probabilities per token, if requested.
-    pub logprobs: Option<Vec<TokenLogProb>>,
+    pub logprobs: Option<Vec<TokenLogprob>>,
+    /// Raw JSON response from the API.
+    pub raw: Value,
+}
+
+/// Response from a completion-scoring call (`backend.score`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoringResponse {
+    /// The completion text that was scored.
+    pub completion: String,
+    /// Per-token logprob info along the completion.
+    pub logprobs: Vec<TokenLogprob>,
     /// Raw JSON response from the API.
     pub raw: Value,
 }
 
 /// Trait for LLM inference backends.
 ///
-/// All backends communicate via HTTP using the OpenAI-compatible chat
-/// completions API (which vLLM, SGLang, and llama.cpp server all support).
+/// Each backend must provide three operations, each in synchronous and
+/// asynchronous forms: [`chat`](LLMBackend::chat) (constrained generation),
+/// [`score`](LLMBackend::score) (force-score a completion), and
+/// [`tokenize`](LLMBackend::tokenize).
 #[async_trait]
 pub trait LLMBackend: Send + Sync {
     /// The model identifier.
@@ -68,28 +104,68 @@ pub trait LLMBackend: Send + Sync {
     /// The base URL of the inference server.
     fn base_url(&self) -> &str;
 
-    /// Perform a synchronous chat completion.
+    /// `true` if [`chat`](LLMBackend::chat) emits the bare label text as its
+    /// content (vLLM/SGLang/llama.cpp); `false` when the label is JSON-wrapped
+    /// (Ollama, which returns `{"label": "..."}`).
+    fn supports_bare_label_constraint(&self) -> bool;
+
+    /// Perform a synchronous constrained chat completion.
+    ///
+    /// When `constrain_labels` is `Some`, the backend must restrict output to
+    /// exactly one of those labels using its native constraint mechanism.
     fn chat(
         &self,
         messages: &[ChatMessage],
         temperature: f64,
-        guided_json: Option<Value>,
+        constrain_labels: Option<&[String]>,
         logprobs: bool,
         top_logprobs: u32,
     ) -> Result<ChatResponse>;
 
-    /// Perform an asynchronous chat completion.
+    /// Score a forced completion synchronously.
+    ///
+    /// Appends `completion` to the rendered prompt and returns per-token
+    /// logprobs along the completion tokens (no generation).
+    fn score(&self, messages: &[ChatMessage], completion: &str) -> Result<ScoringResponse>;
+
+    /// Tokenize text synchronously.
+    ///
+    /// When `context` is provided, tokenization is performed on `context +
+    /// text` and the leading `context` token count is stripped, so the returned
+    /// tokens describe `text` *in that context*.
+    fn tokenize(&self, text: &str, context: Option<&str>) -> Result<Vec<Token>>;
+
+    /// Asynchronous [`chat`](LLMBackend::chat).
     async fn achat(
         &self,
         messages: &[ChatMessage],
         temperature: f64,
-        guided_json: Option<Value>,
+        constrain_labels: Option<&[String]>,
         logprobs: bool,
         top_logprobs: u32,
     ) -> Result<ChatResponse>;
+
+    /// Asynchronous [`score`](LLMBackend::score).
+    async fn ascore(&self, messages: &[ChatMessage], completion: &str) -> Result<ScoringResponse>;
+
+    /// Asynchronous [`tokenize`](LLMBackend::tokenize).
+    async fn atokenize(&self, text: &str, context: Option<&str>) -> Result<Vec<Token>>;
 }
 
-/// Shared helper: build HTTP headers for the OpenAI-compatible API.
+// =========================================================================
+// Shared HTTP helpers (OpenAI-compatible servers)
+// =========================================================================
+
+/// Strip a trailing `/` from a base URL (mirrors the Python base constructor).
+pub fn normalize_base_url(url: impl Into<String>) -> String {
+    let mut s = url.into();
+    while s.ends_with('/') {
+        s.pop();
+    }
+    s
+}
+
+/// Build HTTP headers for the OpenAI-compatible API.
 pub fn build_headers(api_key: &str) -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
@@ -104,13 +180,15 @@ pub fn build_headers(api_key: &str) -> reqwest::header::HeaderMap {
     headers
 }
 
+/// Build the base JSON body for an OpenAI-compatible `/chat/completions` call.
+///
+/// Constraint application is backend-specific and applied by each backend
+/// after this shared body is constructed.
 #[allow(clippy::too_many_arguments)]
-/// Shared helper: build the JSON request body for the OpenAI-compatible API.
-pub fn build_body(
+pub fn build_chat_body(
     model: &str,
     messages: &[ChatMessage],
     temperature: f64,
-    guided_json: Option<Value>,
     logprobs: bool,
     top_logprobs: u32,
     max_tokens: u32,
@@ -125,24 +203,15 @@ pub fn build_body(
         "max_tokens": max_tokens,
     });
 
-    if let Some(schema) = guided_json {
-        body["guided_json"] = schema.clone();
-        body["response_format"] = serde_json::json!({
-            "type": "json_schema",
-            "json_schema": {
-                "name": "classification",
-                "schema": schema,
-                "strict": true,
-            }
-        });
-    }
-
     if logprobs {
         body["logprobs"] = serde_json::json!(true);
         body["top_logprobs"] = serde_json::json!(top_logprobs);
+    } else {
+        // Explicitly opt out so servers that default to returning logprobs
+        // behave consistently.
+        body["logprobs"] = serde_json::json!(false);
     }
 
-    // Merge extra_body overrides
     for (key, val) in extra_body {
         body[key] = val.clone();
     }
@@ -150,8 +219,11 @@ pub fn build_body(
     body
 }
 
-/// Shared helper: parse the JSON response from the OpenAI-compatible API.
-pub fn parse_response(data: &Value) -> ChatResponse {
+/// Parse an OpenAI-compatible `/chat/completions` response.
+///
+/// Flattens each token position's `top_logprobs` array into a
+/// `{token: logprob}` map.
+pub fn parse_chat_response(data: &Value) -> ChatResponse {
     let choice = &data["choices"][0];
     let content = choice["message"]["content"]
         .as_str()
@@ -161,41 +233,71 @@ pub fn parse_response(data: &Value) -> ChatResponse {
     let logprobs_list = choice
         .get("logprobs")
         .and_then(|lp| lp.get("content"))
-        .map(|lp_arr| {
-            let mut result = Vec::new();
-            if let Some(arr) = lp_arr.as_array() {
-                for token_info in arr {
-                    let token = token_info["token"].as_str().unwrap_or("").to_string();
-                    let logprob = token_info["logprob"].as_f64().unwrap_or(0.0);
-                    let top_logprobs = token_info
-                        .get("top_logprobs")
-                        .and_then(|tlp| tlp.as_array())
-                        .map(|tlp_arr| {
-                            tlp_arr
-                                .iter()
-                                .filter_map(|entry| {
-                                    Some(TopLogProb {
-                                        token: entry["token"].as_str()?.to_string(),
-                                        logprob: entry["logprob"].as_f64()?,
-                                    })
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
+        .map(parse_token_logprob_array);
 
-                    result.push(TokenLogProb {
-                        token,
-                        logprob,
-                        top_logprobs,
-                    });
-                }
-            }
-            result
-        });
+    let label = content.trim().to_string();
 
     ChatResponse {
         content,
+        label,
         logprobs: logprobs_list,
         raw: data.clone(),
     }
+}
+
+/// Parse an array of OpenAI-style token-logprob objects into [`TokenLogprob`]s.
+pub fn parse_token_logprob_array(arr: &Value) -> Vec<TokenLogprob> {
+    let mut result = Vec::new();
+    if let Some(arr) = arr.as_array() {
+        for token_info in arr {
+            let token = token_info["token"].as_str().unwrap_or("").to_string();
+            let logprob = token_info["logprob"].as_f64().unwrap_or(0.0);
+            let token_id = token_info["bytes"]
+                .as_array()
+                .map(|a| a.len() as i64)
+                .unwrap_or(-1);
+            let mut top = HashMap::new();
+            if let Some(tlp_arr) = token_info.get("top_logprobs").and_then(|t| t.as_array()) {
+                for entry in tlp_arr {
+                    if let (Some(t), Some(lp)) =
+                        (entry["token"].as_str(), entry["logprob"].as_f64())
+                    {
+                        top.insert(t.to_string(), lp);
+                    }
+                }
+            }
+            result.push(TokenLogprob {
+                token,
+                token_id,
+                logprob,
+                top_logprobs: top,
+            });
+        }
+    }
+    result
+}
+
+/// Render chat messages into a flat prompt string for the `/completions`
+/// scoring path, matching the shape used by the OpenAI-compatible backends:
+///
+/// ```text
+/// <|system|>
+/// {system content}
+///
+/// <|user|>
+/// {user content}
+///
+/// <|assistant|>
+/// ```
+pub fn render_prompt(messages: &[ChatMessage]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for m in messages {
+        parts.push(format!(
+            "<|{role}|>\n{content}",
+            role = m.role,
+            content = m.content
+        ));
+    }
+    parts.push("<|assistant|>\n".to_string());
+    parts.join("\n\n")
 }

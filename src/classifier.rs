@@ -1,9 +1,18 @@
-//! Generic LLM classifier that works with any inference backend.
+//! Backend-agnostic LLM classifier with adaptive scoring.
 //!
-//! This module provides [`LLMClassifier`], a backend-agnostic classifier
-//! that delegates inference to a [`LLMBackend`](crate::backends::LLMBackend)
-//! instance. The public API mirrors the Python `LLMClassifier` so that switching
-//! engines requires changing only the constructor.
+//! Provides [`LLMClassifier`], a backend-agnostic classifier with two
+//! confidence-scoring paths:
+//!
+//! - [`classify`](LLMClassifier::classify) — multi-call completion scoring:
+//!   one backend call per label, geometric-mean logprobs normalized with a
+//!   stable softmax. Exact; N calls for N labels.
+//! - [`generate`](LLMClassifier::generate) — adaptive constrained-generation
+//!   scoring: tokenizes labels, builds a trie, and resolves ambiguity with a
+//!   bounded number of constrained calls (`max_calls`: `1` = fast approximate,
+//!   `None` = fully exact).
+//!
+//! Sync, async (`a*`), and batch (`batch_*` / `abatch_*`) variants are
+//! provided.
 //!
 //! # Example
 //!
@@ -16,11 +25,8 @@
 //!     let backend = VLLMBackend::new("meta-llama/Llama-3.2-3B-Instruct");
 //!     let classifier = LLMClassifier::new(backend);
 //!
-//!     let result = classifier.classify(
-//!         "I love this product!",
-//!         vec!["positive", "negative", "neutral"],
-//!         None,
-//!     )?;
+//!     let result = classifier
+//!         .classify("I love this product!", vec!["positive", "negative", "neutral"], None)?;
 //!
 //!     println!("Prediction: {}", result.prediction);
 //!     println!("Confidence: {:.2}%", result.confidence * 100.0);
@@ -29,28 +35,47 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
-use serde_json::Value;
 
 use crate::backends::base::{ChatMessage, LLMBackend};
-use crate::prompts::{
-    build_classification_prompt, build_json_schema_for_choices, get_choice_labels,
+use crate::prompts::{build_classification_prompt, get_choice_labels};
+use crate::scoring::{
+    geometric_mean_logprob, identify_unresolved_clusters, score_labels_from_winning_path,
+    stable_softmax, Cluster, LabelTrie,
 };
 use crate::types::{Choices, ClassificationResult};
 
+/// Default number of worker threads for synchronous batch classification.
+const DEFAULT_MAX_WORKERS: usize = 4;
+
 /// A backend-agnostic text classifier.
 ///
-/// Provides the same classification interface regardless of which
-/// inference backend is used (vLLM, SGLang, llama.cpp, etc.).
+/// Generic over any [`LLMBackend`]. Construct with [`LLMClassifier::new`]
+/// (default `max_workers = 4`) or [`LLMClassifier::with_max_workers`].
 pub struct LLMClassifier<B: LLMBackend> {
     backend: B,
+    max_workers: usize,
 }
 
 impl<B: LLMBackend> LLMClassifier<B> {
-    /// Create a new classifier with the given backend.
+    /// Create a new classifier with the given backend and the default
+    /// concurrency (`max_workers = 4`).
     pub fn new(backend: B) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            max_workers: DEFAULT_MAX_WORKERS,
+        }
+    }
+
+    /// Create a new classifier with an explicit sync-batch concurrency.
+    pub fn with_max_workers(backend: B, max_workers: usize) -> Self {
+        Self {
+            backend,
+            max_workers: max_workers.max(1),
+        }
     }
 
     /// Get a reference to the underlying backend.
@@ -58,9 +83,9 @@ impl<B: LLMBackend> LLMClassifier<B> {
         &self.backend
     }
 
-    // =========================================================================
+    // ----------------------------------------------------------------------
     // Internal helpers
-    // =========================================================================
+    // ----------------------------------------------------------------------
 
     fn to_messages(system: &str, user: &str) -> Vec<ChatMessage> {
         vec![
@@ -69,116 +94,21 @@ impl<B: LLMBackend> LLMClassifier<B> {
         ]
     }
 
-    fn extract_logprob_sum(response: &crate::backends::base::ChatResponse) -> f64 {
-        match &response.logprobs {
-            Some(logprobs) => logprobs.iter().map(|entry| entry.logprob).sum(),
-            None => 0.0,
-        }
+    /// Minimum `top_logprobs` budget for the adaptive path.
+    fn top_logprobs_budget(trie: &LabelTrie) -> u32 {
+        trie.max_branching_factor().max(5) as u32
     }
 
-    /// Numerically stable softmax over log probabilities.
-    pub(crate) fn softmax(logprobs: &HashMap<String, f64>) -> HashMap<String, f64> {
-        let valid: Vec<(&String, &f64)> = logprobs
-            .iter()
-            .filter(|(_, &v)| v > f64::NEG_INFINITY)
-            .collect();
+    // ======================================================================
+    // classify — multi-call completion scoring
+    // ======================================================================
 
-        if valid.is_empty() {
-            let n = logprobs.len() as f64;
-            return logprobs.keys().map(|k| (k.clone(), 1.0 / n)).collect();
-        }
-
-        let max_lp = valid
-            .iter()
-            .map(|(_, &v)| v)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let mut exp_vals: HashMap<String, f64> = HashMap::new();
-        let mut total = 0.0;
-
-        for (key, &val) in logprobs {
-            let exp_val = if val > f64::NEG_INFINITY {
-                (val - max_lp).exp()
-            } else {
-                0.0
-            };
-            exp_vals.insert(key.clone(), exp_val);
-            total += exp_val;
-        }
-
-        if total == 0.0 {
-            let n = logprobs.len() as f64;
-            return logprobs.keys().map(|k| (k.clone(), 1.0 / n)).collect();
-        }
-
-        exp_vals.into_iter().map(|(k, v)| (k, v / total)).collect()
-    }
-
-    /// Get log P(choice | context) for a single choice by appending it as
-    /// a forced continuation and reading the token logprobs.
-    fn get_choice_logprob(&self, system: &str, user: &str, label: &str) -> f64 {
-        // We ask the model to complete with the label and read the logprob
-        // of the first generated token. We use a prompt that encourages the
-        // model to output the label.
-        let forced_user = format!("{user}\n\nCategory: {label}");
-        let messages = Self::to_messages(system, &forced_user);
-
-        match self.backend.chat(&messages, 0.0, None, true, 5) {
-            Ok(response) => {
-                // Use the sum of all token logprobs as the score
-                Self::extract_logprob_sum(&response)
-            }
-            Err(_) => f64::NEG_INFINITY,
-        }
-    }
-
-    // =========================================================================
-    // Sync Methods — Generate
-    // =========================================================================
-
-    /// Generate a constrained classification for a single text.
+    /// Classify text with calibrated confidence scores via multi-call
+    /// completion scoring.
     ///
-    /// Uses JSON schema with enum constraint to ensure only valid choices
-    /// are generated. This is the fastest method as it only makes one API
-    /// call and does not compute confidence scores.
-    pub fn generate(
-        &self,
-        text: &str,
-        choices: impl Into<Choices>,
-        system_prompt: Option<&str>,
-    ) -> Result<String> {
-        let choices = choices.into();
-        let labels = get_choice_labels(&choices);
-        let (system, user) = build_classification_prompt(text, &choices, system_prompt);
-        let schema = build_json_schema_for_choices(&labels);
-        let messages = Self::to_messages(&system, &user);
-
-        let response = self.backend.chat(&messages, 0.0, Some(schema), false, 5)?;
-
-        let parsed: Value = serde_json::from_str(&response.content)?;
-        Ok(parsed["label"].as_str().unwrap_or("").to_string())
-    }
-
-    /// Generate constrained classifications for multiple texts.
-    pub fn batch_generate(
-        &self,
-        texts: &[&str],
-        choices: impl Into<Choices> + Clone,
-        system_prompt: Option<&str>,
-    ) -> Result<Vec<String>> {
-        texts
-            .iter()
-            .map(|text| self.generate(text, choices.clone().into(), system_prompt))
-            .collect()
-    }
-
-    // =========================================================================
-    // Sync Methods — Classify
-    // =========================================================================
-
-    /// Classify text with calibrated confidence scores.
-    ///
-    /// Uses multi-call evaluation to compute calibrated probabilities
-    /// for each choice. Makes N API calls for N choices.
+    /// Makes one backend call per label (via `backend.score`), takes the
+    /// geometric-mean logprob of each completion's tokens, and normalizes with
+    /// a stable softmax. Exact; N calls for N labels.
     pub fn classify(
         &self,
         text: &str,
@@ -188,91 +118,22 @@ impl<B: LLMBackend> LLMClassifier<B> {
         let choices = choices.into();
         let labels = get_choice_labels(&choices);
         let (system, user) = build_classification_prompt(text, &choices, system_prompt);
-
-        let mut logprobs: HashMap<String, f64> = HashMap::new();
-        for label in &labels {
-            logprobs.insert(
-                label.clone(),
-                self.get_choice_logprob(&system, &user, label),
-            );
-        }
-
-        let probabilities = Self::softmax(&logprobs);
-        let prediction = probabilities
-            .iter()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(k, _)| k.clone())
-            .expect("at least one choice required");
-        let confidence = probabilities[&prediction];
-
-        Ok(ClassificationResult::new(
-            prediction,
-            confidence,
-            probabilities,
-        ))
-    }
-
-    /// Classify multiple texts with calibrated confidence scores.
-    pub fn batch_classify(
-        &self,
-        texts: &[&str],
-        choices: impl Into<Choices> + Clone,
-        system_prompt: Option<&str>,
-    ) -> Result<Vec<ClassificationResult>> {
-        texts
-            .iter()
-            .map(|text| self.classify(text, choices.clone().into(), system_prompt))
-            .collect()
-    }
-
-    // =========================================================================
-    // Async Methods — Generate
-    // =========================================================================
-
-    /// Async version of [`generate`](LLMClassifier::generate).
-    pub async fn agenerate(
-        &self,
-        text: &str,
-        choices: impl Into<Choices>,
-        system_prompt: Option<&str>,
-    ) -> Result<String> {
-        let choices = choices.into();
-        let labels = get_choice_labels(&choices);
-        let (system, user) = build_classification_prompt(text, &choices, system_prompt);
-        let schema = build_json_schema_for_choices(&labels);
         let messages = Self::to_messages(&system, &user);
 
-        let response = self
-            .backend
-            .achat(&messages, 0.0, Some(schema), false, 5)
-            .await?;
-
-        let parsed: Value = serde_json::from_str(&response.content)?;
-        Ok(parsed["label"].as_str().unwrap_or("").to_string())
-    }
-
-    /// Async version of [`batch_generate`](LLMClassifier::batch_generate).
-    pub async fn abatch_generate(
-        &self,
-        texts: &[&str],
-        choices: impl Into<Choices> + Clone,
-        system_prompt: Option<&str>,
-    ) -> Result<Vec<String>> {
-        let mut results = Vec::new();
-        for text in texts {
-            results.push(
-                self.agenerate(text, choices.clone().into(), system_prompt)
-                    .await?,
-            );
+        let mut raw_scores: HashMap<String, f64> = HashMap::new();
+        for label in &labels {
+            let lps = match self.backend.score(&messages, label) {
+                Ok(resp) => resp.logprobs.iter().map(|t| t.logprob).collect::<Vec<_>>(),
+                Err(_) => Vec::new(),
+            };
+            let score = geometric_mean_logprob(&lps).unwrap_or(f64::NEG_INFINITY);
+            raw_scores.insert(label.clone(), score);
         }
-        Ok(results)
+        Ok(self.finalize_multi_call(raw_scores, labels.len()))
     }
 
-    // =========================================================================
-    // Async Methods — Classify
-    // =========================================================================
-
-    /// Async version of [`classify`](LLMClassifier::classify).
+    /// Asynchronous [`classify`](LLMClassifier::classify). Runs all per-label
+    /// `ascore` calls concurrently.
     pub async fn aclassify(
         &self,
         text: &str,
@@ -282,87 +143,462 @@ impl<B: LLMBackend> LLMClassifier<B> {
         let choices = choices.into();
         let labels = get_choice_labels(&choices);
         let (system, user) = build_classification_prompt(text, &choices, system_prompt);
+        let messages = Arc::new(Self::to_messages(&system, &user));
 
-        let mut logprobs: HashMap<String, f64> = HashMap::new();
+        let mut futs = Vec::with_capacity(labels.len());
         for label in &labels {
-            let lp = self.aget_choice_logprob(&system, &user, label).await;
-            logprobs.insert(label.clone(), lp);
+            let messages = messages.clone();
+            let label = label.clone();
+            futs.push(async move {
+                let lps = match self.backend.ascore(&messages, &label).await {
+                    Ok(resp) => resp.logprobs.iter().map(|t| t.logprob).collect::<Vec<_>>(),
+                    Err(_) => Vec::new(),
+                };
+                let score = geometric_mean_logprob(&lps).unwrap_or(f64::NEG_INFINITY);
+                (label, score)
+            });
+        }
+        let results = futures::future::join_all(futs).await;
+        let raw_scores: HashMap<String, f64> = results.into_iter().collect();
+        Ok(self.finalize_multi_call(raw_scores, labels.len()))
+    }
+
+    fn finalize_multi_call(
+        &self,
+        raw_scores: HashMap<String, f64>,
+        n_calls: usize,
+    ) -> ClassificationResult {
+        let probabilities = stable_softmax(&raw_scores).unwrap_or_default();
+        let prediction = argmax(&probabilities).unwrap_or_default();
+        let confidence = probabilities.get(&prediction).copied().unwrap_or(0.0);
+        ClassificationResult::new_multi_call(prediction, confidence, probabilities, n_calls as i64)
+    }
+
+    // ======================================================================
+    // generate — adaptive trie-masked constrained generation
+    // ======================================================================
+
+    /// Classify text via adaptive constrained-generation scoring.
+    ///
+    /// Tokenizes each label, builds a trie, and makes constrained generation
+    /// calls (with per-position top-logprobs) to score each label against the
+    /// winning path. The `max_calls` budget bounds the number of backend
+    /// calls:
+    /// - `Some(1)` (default) — a single fast call; scoring is partial /
+    ///   approximate when labels share token prefixes.
+    /// - `Some(k)` — up to `k` adaptive calls to resolve ambiguity.
+    /// - `None` — fully recursive until exact.
+    pub fn generate(
+        &self,
+        text: &str,
+        choices: impl Into<Choices>,
+        system_prompt: Option<&str>,
+        max_calls: Option<usize>,
+    ) -> Result<ClassificationResult> {
+        let choices = choices.into();
+        let labels = get_choice_labels(&choices);
+        let (system, user) = build_classification_prompt(text, &choices, system_prompt);
+        let messages = Self::to_messages(&system, &user);
+
+        let token_context = self.token_context();
+        let mut token_sequences: HashMap<String, Vec<String>> = HashMap::new();
+        for label in &labels {
+            let tokens = self
+                .backend
+                .tokenize(label, token_context)
+                .unwrap_or_default();
+            let seq: Vec<String> = tokens
+                .into_iter()
+                .map(|t| {
+                    if t.text.is_empty() {
+                        format!("token_{}", t.id)
+                    } else {
+                        t.text
+                    }
+                })
+                .collect();
+            token_sequences.insert(label.clone(), seq);
         }
 
-        let probabilities = Self::softmax(&logprobs);
-        let prediction = probabilities
-            .iter()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(k, _)| k.clone())
-            .expect("at least one choice required");
-        let confidence = probabilities[&prediction];
+        Ok(self.run_adaptive(&messages, &labels, token_sequences, max_calls))
+    }
 
-        Ok(ClassificationResult::new(
+    /// Asynchronous [`generate`](LLMClassifier::generate). Tokenizes labels
+    /// concurrently before running the adaptive loop.
+    pub async fn agenerate(
+        &self,
+        text: &str,
+        choices: impl Into<Choices>,
+        system_prompt: Option<&str>,
+        max_calls: Option<usize>,
+    ) -> Result<ClassificationResult> {
+        let choices = choices.into();
+        let labels = get_choice_labels(&choices);
+        let (system, user) = build_classification_prompt(text, &choices, system_prompt);
+        let messages = Self::to_messages(&system, &user);
+
+        let token_context = self.token_context().map(String::from);
+        let mut futs = Vec::with_capacity(labels.len());
+        for label in &labels {
+            let label = label.clone();
+            let ctx = token_context.clone();
+            futs.push(async move {
+                let tokens = self
+                    .backend
+                    .atokenize(&label, ctx.as_deref())
+                    .await
+                    .unwrap_or_default();
+                let seq: Vec<String> = tokens
+                    .into_iter()
+                    .map(|t| {
+                        if t.text.is_empty() {
+                            format!("token_{}", t.id)
+                        } else {
+                            t.text
+                        }
+                    })
+                    .collect();
+                (label, seq)
+            });
+        }
+        let results = futures::future::join_all(futs).await;
+        let token_sequences: HashMap<String, Vec<String>> = results.into_iter().collect();
+
+        Ok(self.run_adaptive(&messages, &labels, token_sequences, max_calls))
+    }
+
+    /// The tokenization context prefix for labels (Ollama wraps labels in
+    /// `{"label": "..."}`, so labels must be tokenized in that context).
+    fn token_context(&self) -> Option<&str> {
+        if self.backend.supports_bare_label_constraint() {
+            None
+        } else {
+            Some(crate::backends::ollama::JSON_LABEL_CONTEXT)
+        }
+    }
+
+    /// Core adaptive loop shared by the sync and async paths.
+    fn run_adaptive(
+        &self,
+        messages: &[ChatMessage],
+        labels: &[String],
+        token_sequences: HashMap<String, Vec<String>>,
+        max_calls: Option<usize>,
+    ) -> ClassificationResult {
+        let mut trie = LabelTrie::new();
+        for label in labels {
+            if let Some(seq) = token_sequences.get(label) {
+                trie.insert(label, seq);
+            }
+        }
+        let k = Self::top_logprobs_budget(&trie);
+
+        // Per-label accumulated step logprobs (over the winning path).
+        let mut all_step_logprobs: HashMap<String, Vec<f64>> = HashMap::new();
+        for label in labels {
+            all_step_logprobs.insert(label.clone(), Vec::new());
+        }
+        // Per-label resolved prefix length.
+        let mut resolved: HashMap<String, usize> = labels.iter().map(|l| (l.clone(), 0)).collect();
+
+        let mut frontier: Vec<Cluster> = vec![Cluster {
+            labels: labels.to_vec(),
+            resolved_length: 0,
+        }];
+        let mut calls_made: usize = 0;
+
+        while !frontier.is_empty() && max_calls.is_none_or(|m| calls_made < m) {
+            let cluster = frontier.remove(0);
+            calls_made += 1;
+
+            let response = match self
+                .backend
+                .chat(messages, 0.0, Some(&cluster.labels), true, k)
+            {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            let winning_label = response.label.clone();
+            let step_logprobs =
+                extract_step_logprobs(response.logprobs.as_deref().unwrap_or_default(), &trie);
+
+            // Score every label against the winning path up to its divergence point.
+            let scored_lengths = {
+                let mut m = HashMap::new();
+                for label in labels {
+                    let seq = token_sequences.get(label).cloned().unwrap_or_default();
+                    let win = token_sequences
+                        .get(&winning_label)
+                        .cloned()
+                        .unwrap_or_default();
+                    let dp = crate::scoring::divergence_point(&seq, &win);
+                    m.insert(label.clone(), dp);
+                }
+                m
+            };
+            let per_label_scores =
+                score_labels_from_winning_path(&token_sequences, &winning_label, &step_logprobs);
+
+            // Append newly scored token logprobs for each label.
+            for label in labels {
+                let new_len = *scored_lengths.get(label).unwrap_or(&0);
+                let old_len = *resolved.get(label).unwrap_or(&0);
+                if new_len > old_len {
+                    // Recompute the per-position logprobs contributed for this label's
+                    // tokens on the winning path over [old_len, new_len).
+                    let seq = token_sequences.get(label).cloned().unwrap_or_default();
+                    let bucket = all_step_logprobs.entry(label.clone()).or_default();
+                    for i in old_len..new_len {
+                        let tok = seq.get(i).cloned().unwrap_or_default();
+                        let lp = step_logprobs
+                            .get(i)
+                            .and_then(|m| m.get(&tok).copied())
+                            .unwrap_or(f64::NEG_INFINITY);
+                        bucket.push(lp);
+                    }
+                    resolved.insert(label.clone(), new_len);
+                }
+                // Record the label's overall score (used only for diagnostics; final
+                // scoring re-derives from all_step_logprobs).
+                let _ = per_label_scores.get(label);
+            }
+
+            let unresolved = identify_unresolved_clusters(&token_sequences, &resolved);
+            frontier.extend(unresolved);
+        }
+
+        // Final per-label scores + coverage from accumulated step logprobs.
+        let mut raw_scores: HashMap<String, f64> = HashMap::new();
+        let mut coverage: HashMap<String, f64> = HashMap::new();
+        for label in labels {
+            let lps = all_step_logprobs.get(label).cloned().unwrap_or_default();
+            let total = token_sequences.get(label).map(|s| s.len()).unwrap_or(0);
+            let score = geometric_mean_logprob(&lps).unwrap_or(f64::NEG_INFINITY);
+            raw_scores.insert(label.clone(), score);
+            let cov = if total == 0 {
+                0.0
+            } else {
+                lps.len() as f64 / total as f64
+            };
+            coverage.insert(label.clone(), cov);
+        }
+
+        let probabilities = stable_softmax(&raw_scores).unwrap_or_default();
+        let prediction = argmax(&probabilities).unwrap_or_default();
+        let confidence = probabilities.get(&prediction).copied().unwrap_or(0.0);
+        let approximate = coverage.values().any(|&c| c < 1.0);
+
+        ClassificationResult::new_adaptive(
             prediction,
             confidence,
             probabilities,
-        ))
+            coverage,
+            calls_made as i64,
+            approximate,
+        )
     }
 
-    /// Async version of [`batch_classify`](LLMClassifier::batch_classify).
+    // ======================================================================
+    // Batch methods
+    // ======================================================================
+
+    /// Synchronous batch [`classify`](LLMClassifier::classify), run across up
+    /// to `max_workers` threads.
+    pub fn batch_classify(
+        &self,
+        texts: &[&str],
+        choices: impl Into<Choices> + Clone,
+        system_prompt: Option<&str>,
+    ) -> Result<Vec<ClassificationResult>> {
+        let choices = choices.into();
+        let labels = get_choice_labels(&choices);
+        let sp = system_prompt.map(|s| s.to_string());
+        run_batch_sync(self.max_workers, self, texts, move |this, text| {
+            let (system, user) = build_classification_prompt(text, &choices, sp.as_deref());
+            let messages = Self::to_messages(&system, &user);
+            let mut raw_scores: HashMap<String, f64> = HashMap::new();
+            for label in &labels {
+                let lps = match this.backend.score(&messages, label) {
+                    Ok(resp) => resp.logprobs.iter().map(|t| t.logprob).collect::<Vec<_>>(),
+                    Err(_) => Vec::new(),
+                };
+                raw_scores.insert(
+                    label.clone(),
+                    geometric_mean_logprob(&lps).unwrap_or(f64::NEG_INFINITY),
+                );
+            }
+            Ok(this.finalize_multi_call(raw_scores, labels.len()))
+        })
+    }
+
+    /// Synchronous batch [`generate`](LLMClassifier::generate), run across up
+    /// to `max_workers` threads. Uses the default `max_calls = Some(1)`.
+    pub fn batch_generate(
+        &self,
+        texts: &[&str],
+        choices: impl Into<Choices> + Clone,
+        system_prompt: Option<&str>,
+    ) -> Result<Vec<ClassificationResult>> {
+        let choices = choices.into();
+        let sp = system_prompt.map(|s| s.to_string());
+        run_batch_sync(self.max_workers, self, texts, move |this, text| {
+            this.generate(text, choices.clone(), sp.as_deref(), Some(1))
+        })
+    }
+
+    /// Asynchronous batch [`classify`](LLMClassifier::aclassify), run
+    /// concurrently for all texts.
     pub async fn abatch_classify(
         &self,
         texts: &[&str],
         choices: impl Into<Choices> + Clone,
         system_prompt: Option<&str>,
     ) -> Result<Vec<ClassificationResult>> {
-        let mut results = Vec::new();
+        let sp = system_prompt.map(|s| s.to_string());
+        let mut futs = Vec::with_capacity(texts.len());
         for text in texts {
-            results.push(
-                self.aclassify(text, choices.clone().into(), system_prompt)
-                    .await?,
-            );
+            futs.push(self.aclassify(text, choices.clone(), sp.as_deref()));
         }
-        Ok(results)
+        futures::future::join_all(futs).await.into_iter().collect()
     }
 
-    // =========================================================================
-    // Internal async helpers
-    // =========================================================================
-
-    async fn aget_choice_logprob(&self, system: &str, user: &str, label: &str) -> f64 {
-        let forced_user = format!("{user}\n\nCategory: {label}");
-        let messages = Self::to_messages(system, &forced_user);
-
-        match self.backend.achat(&messages, 0.0, None, true, 5).await {
-            Ok(response) => Self::extract_logprob_sum(&response),
-            Err(_) => f64::NEG_INFINITY,
+    /// Asynchronous batch [`generate`](LLMClassifier::agenerate), run
+    /// concurrently for all texts. Uses the default `max_calls = Some(1)`.
+    pub async fn abatch_generate(
+        &self,
+        texts: &[&str],
+        choices: impl Into<Choices> + Clone,
+        system_prompt: Option<&str>,
+    ) -> Result<Vec<ClassificationResult>> {
+        let sp = system_prompt.map(|s| s.to_string());
+        let mut futs = Vec::with_capacity(texts.len());
+        for text in texts {
+            futs.push(self.agenerate(text, choices.clone(), sp.as_deref(), Some(1)));
         }
+        futures::future::join_all(futs).await.into_iter().collect()
     }
+}
+
+// =========================================================================
+// Free helpers
+// =========================================================================
+
+/// Pick the key with the maximum value, breaking ties deterministically by
+/// taking the *first* maximum encountered during iteration order (matches the
+/// Python `max(probabilities, key=...)` semantics for dict insertion order).
+fn argmax(probs: &HashMap<String, f64>) -> Option<String> {
+    probs
+        .iter()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(k, _)| k.clone())
+}
+
+/// Run a synchronous batch across up to `max_workers` scoped threads.
+///
+/// Each worker pulls the next text index from a shared atomic counter and
+/// applies `work(this, text)` to it, writing the result into a pre-sized slot.
+/// Scoped threads borrow `this` and `texts` for the duration of the scope, so
+/// no `'static` bound on `B` is required.
+fn run_batch_sync<B, F>(
+    max_workers: usize,
+    this: &LLMClassifier<B>,
+    texts: &[&str],
+    work: F,
+) -> Result<Vec<ClassificationResult>>
+where
+    B: LLMBackend,
+    F: Fn(&LLMClassifier<B>, &str) -> Result<ClassificationResult> + Sync + Send,
+{
+    let n = texts.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let next = Arc::new(AtomicUsize::new(0));
+    let mut out: Vec<Option<Result<ClassificationResult>>> = (0..n).map(|_| None).collect();
+    let n_workers = max_workers.min(n).max(1);
+
+    // Cast the output base pointer to `usize` so it is `Send`/`Sync` across
+    // scoped threads. Each thread writes to a distinct, disjoint index.
+    //
+    // SAFETY: indices handed out by the atomic counter are unique, so no two
+    // threads ever touch the same slot. The scope joins all threads before
+    // `out` is read again below.
+    let out_ptr: usize = out.as_mut_ptr() as usize;
+    let work = &work;
+    std::thread::scope(|s| {
+        for _ in 0..n_workers {
+            let next = next.clone();
+            s.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    if i >= n {
+                        break;
+                    }
+                    // SAFETY: `i` is unique (atomic fetch-add), so this slot is
+                    // never aliased by another thread.
+                    let slot = unsafe {
+                        &mut *(out_ptr as *mut Option<Result<ClassificationResult>>).add(i)
+                    };
+                    *slot = Some(work(this, texts[i]));
+                }
+            });
+        }
+    });
+
+    out.into_iter()
+        .map(|slot| slot.expect("every index must have been filled"))
+        .collect()
+}
+
+/// Extract per-step candidate-token logprob maps along the winning path,
+/// filtered to tokens that are valid continuations in the label trie at that
+/// depth.
+///
+/// At each token position we keep every candidate from the server's
+/// `top_logprobs` that could extend *some* label prefix; this is what lets the
+/// scoring functions re-evaluate non-winning labels against the same evidence.
+fn extract_step_logprobs(
+    logprobs: &[crate::backends::base::TokenLogprob],
+    trie: &LabelTrie,
+) -> Vec<HashMap<String, f64>> {
+    let mut steps = Vec::with_capacity(logprobs.len());
+    let root = trie.root();
+    let mut node = root;
+    for tlp in logprobs {
+        let mut filtered: HashMap<String, f64> = HashMap::new();
+        // Include any top-logprob token that is a valid child of the current
+        // trie node (i.e. a continuation of at least one label).
+        for (tok, &lp) in &tlp.top_logprobs {
+            if node.children.contains_key(tok) {
+                filtered.insert(tok.clone(), lp);
+            }
+        }
+        // Also include the emitted token itself if it advances the trie.
+        if let Some(child) = node.children.get(&tlp.token) {
+            filtered.entry(tlp.token.clone()).or_insert(tlp.logprob);
+            node = child;
+        } else {
+            // Emitted token isn't a known label continuation; keep the filtered
+            // set but do not descend (subsequent positions are off the trie).
+        }
+        steps.push(filtered);
+    }
+    steps
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backends::VLLMBackend;
+    use std::collections::HashMap as StdHashMap;
 
     #[test]
-    fn test_softmax_basic() {
-        let mut logprobs = HashMap::new();
-        logprobs.insert("a".into(), -1.0);
-        logprobs.insert("b".into(), -2.0);
-        logprobs.insert("c".into(), -3.0);
-
-        let probs = LLMClassifier::<VLLMBackend>::softmax(&logprobs);
-        assert!((probs["a"] - 0.6652).abs() < 0.01);
-        assert!((probs["b"] - 0.2447).abs() < 0.01);
-        assert!((probs["c"] - 0.0900).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_softmax_all_negative_infinity() {
-        let mut logprobs = HashMap::new();
-        logprobs.insert("a".into(), f64::NEG_INFINITY);
-        logprobs.insert("b".into(), f64::NEG_INFINITY);
-
-        let probs = LLMClassifier::<VLLMBackend>::softmax(&logprobs);
-        assert!((probs["a"] - 0.5).abs() < 0.01);
-        assert!((probs["b"] - 0.5).abs() < 0.01);
+    fn test_argmax() {
+        let mut m = StdHashMap::new();
+        m.insert("a".to_string(), 0.1);
+        m.insert("b".to_string(), 0.7);
+        m.insert("c".to_string(), 0.2);
+        assert_eq!(argmax(&m), Some("b".to_string()));
     }
 
     #[test]
