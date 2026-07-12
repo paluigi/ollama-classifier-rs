@@ -5,6 +5,12 @@
 //! The server's JSON-schema `response_format` is deliberately avoided (it is
 //! unreliable on current versions), so the bare-label grammar is used instead.
 //!
+//! Both `score()` and `tokenize()` use forced constrained generation via GBNF
+//! grammar because llama.cpp does **not** support `echo=true` on the
+//! completions endpoint (it only returns generated-token logprobs, not prompt
+//! tokens), so the echo/prefill approach used by vLLM and SGLang is
+//! unavailable.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -57,7 +63,7 @@ impl LlamaCppBackend {
                 max_tokens: 256,
                 extra_body: HashMap::new(),
                 constraint: Constraint::Grammar,
-                boundary: BoundaryStrategy::FillMiddle,
+                boundary: BoundaryStrategy::Forced,
             },
         }
     }

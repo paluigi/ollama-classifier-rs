@@ -6,8 +6,8 @@
 //!
 //! ## Supported Backends
 //!
-//! - **Ollama** — native Ollama API (`/api/chat`, `/api/generate`, `/api/tokenize`)
-//! - **vLLM** — OpenAI-compatible, `guided_choice` constraints
+//! - **Ollama** — native Ollama API (`/api/chat`), forced constrained generation
+//! - **vLLM** — OpenAI-compatible, `structured_outputs.choice` constraints
 //! - **SGLang** — OpenAI-compatible, `regex` constraints
 //! - **llama.cpp** — OpenAI-compatible, GBNF `grammar` constraints
 //!

@@ -1,7 +1,14 @@
 //! SGLang inference backend.
 //!
 //! SGLang exposes an OpenAI-compatible API and supports `regex` constraints for
-//! constraining output to a label set.
+//! constraining output to a label set, generating bare label text with no JSON
+//! wrapper.
+//!
+//! `score()` uses echo/prefill (`/v1/completions` with `echo=true`) to recover
+//! genuine per-label logprobs. The `/tokenize` endpoint (with the correct
+//! `"prompt"` field) pinpoints the label-token boundary. `tokenize()` uses
+//! forced constrained generation via regex so token boundaries match the actual
+//! constrained-generation output.
 //!
 //! # Example
 //!
