@@ -1,11 +1,19 @@
 //! Ollama inference backend.
 //!
-//! Talks to [Ollama](https://ollama.com) via its native API
-//! (`/api/chat`, `/api/generate`, `/api/tokenize`) over HTTP. Logprobs support
-//! requires Ollama ≥ 0.12. Unlike the OpenAI-compatible backends, Ollama
-//! wraps the constrained label in a JSON object `{"label": "..."}`, so it
-//! reports [`supports_bare_label_constraint`](super::LLMBackend::supports_bare_label_constraint)
+//! Talks to [Ollama](https://ollama.com) via its native API (`/api/chat`) over
+//! HTTP. Logprobs support requires Ollama ≥ 0.12. Unlike the OpenAI-compatible
+//! backends, Ollama wraps the constrained label in a JSON object
+//! `{"label": "..."}`, so it reports
+//! [`supports_bare_label_constraint`](super::LLMBackend::supports_bare_label_constraint)
 //! as `false`.
+//!
+//! Modern Ollama removed the `/api/tokenize` endpoint and does not support
+//! fill-in-the-middle ("insert") on instruct models. This backend therefore
+//! obtains both label tokenization and completion scores through empirical
+//! *forced constrained generation*: it forces a label as the only valid choice
+//! in a `chat()` call and reads back the model's genuine per-token logprobs.
+//! No `/api/tokenize` or `suffix`/insert calls are used. Tokenization results
+//! are memoized per label.
 //!
 //! # Example
 //!
@@ -18,6 +26,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -49,6 +58,8 @@ pub struct OllamaBackend {
     extra_body: HashMap<String, Value>,
     client: reqwest::blocking::Client,
     async_client: reqwest::Client,
+    /// Per-label tokenization memoization cache.
+    token_cache: Mutex<HashMap<String, Vec<Token>>>,
 }
 
 impl OllamaBackend {
@@ -131,32 +142,55 @@ impl LLMBackend for OllamaBackend {
     }
 
     fn score(&self, messages: &[ChatMessage], completion: &str) -> Result<ScoringResponse> {
-        let prompt = render_prompt(messages);
-        let mut body = json!({
-            "model": self.model,
-            "prompt": prompt,
-            "suffix": completion,
-            "stream": false,
-            "logprobs": 1,
-            "options": { "num_predict": 0, "temperature": 0.0 },
-        });
-        merge_extra(&mut body, &self.extra_body);
-
-        let data = self.post("/api/generate", &body)?;
-        let lps = data
-            .get("logprobs")
-            .and_then(|v| v.as_array())
-            .map(|a| parse_ollama_logprobs(a))
-            .unwrap_or_default();
+        // Force the completion as the only valid label via a JSON-enum
+        // constrained chat() call and read back the model's genuine per-token
+        // logprobs (teacher forcing).
+        let labels = vec![completion.to_string()];
+        let response = self.chat(messages, 0.0, Some(&labels), true, 1)?;
+        let lps =
+            label_token_logprobs(response.logprobs.as_deref().unwrap_or_default(), completion);
+        if lps.is_empty() {
+            anyhow::bail!("score({completion:?}): forced generation returned no value tokens");
+        }
         Ok(ScoringResponse {
             completion: completion.to_string(),
             logprobs: lps,
-            raw: data,
+            raw: response.raw,
         })
     }
 
-    fn tokenize(&self, text: &str, context: Option<&str>) -> Result<Vec<Token>> {
-        tokenize_native(&self.client, &self.host, &self.model, text, context)
+    fn tokenize(&self, text: &str, _context: Option<&str>) -> Result<Vec<Token>> {
+        // Check cache
+        if let Some(cached) = self.token_cache.lock().unwrap().get(text) {
+            return Ok(cached.clone());
+        }
+
+        // Force the text as the only valid label in a constrained chat() call.
+        let messages = vec![ChatMessage::new("user", text)];
+        let labels = vec![text.to_string()];
+        let response = self.chat(&messages, 0.0, Some(&labels), true, 1)?;
+        let lps = label_token_logprobs(response.logprobs.as_deref().unwrap_or_default(), text);
+        let tokens: Vec<Token> = if lps.is_empty() {
+            vec![Token {
+                text: text.to_string(),
+                id: -1,
+            }]
+        } else {
+            lps.iter()
+                .map(|lp| Token {
+                    text: lp.token.clone(),
+                    id: -1,
+                })
+                .collect()
+        };
+
+        // Memoize
+        self.token_cache
+            .lock()
+            .unwrap()
+            .insert(text.to_string(), tokens.clone());
+
+        Ok(tokens)
     }
 
     async fn achat(
@@ -202,32 +236,50 @@ impl LLMBackend for OllamaBackend {
     }
 
     async fn ascore(&self, messages: &[ChatMessage], completion: &str) -> Result<ScoringResponse> {
-        let prompt = render_prompt(messages);
-        let mut body = json!({
-            "model": self.model,
-            "prompt": prompt,
-            "suffix": completion,
-            "stream": false,
-            "logprobs": 1,
-            "options": { "num_predict": 0, "temperature": 0.0 },
-        });
-        merge_extra(&mut body, &self.extra_body);
-
-        let data = self.apost("/api/generate", &body).await?;
-        let lps = data
-            .get("logprobs")
-            .and_then(|v| v.as_array())
-            .map(|a| parse_ollama_logprobs(a))
-            .unwrap_or_default();
+        let labels = vec![completion.to_string()];
+        let response = self.achat(messages, 0.0, Some(&labels), true, 1).await?;
+        let lps =
+            label_token_logprobs(response.logprobs.as_deref().unwrap_or_default(), completion);
+        if lps.is_empty() {
+            anyhow::bail!("ascore({completion:?}): forced generation returned no value tokens");
+        }
         Ok(ScoringResponse {
             completion: completion.to_string(),
             logprobs: lps,
-            raw: data,
+            raw: response.raw,
         })
     }
 
-    async fn atokenize(&self, text: &str, context: Option<&str>) -> Result<Vec<Token>> {
-        tokenize_native_async(&self.async_client, &self.host, &self.model, text, context).await
+    async fn atokenize(&self, text: &str, _context: Option<&str>) -> Result<Vec<Token>> {
+        // Check cache (shared between sync and async)
+        if let Some(cached) = self.token_cache.lock().unwrap().get(text) {
+            return Ok(cached.clone());
+        }
+
+        let messages = vec![ChatMessage::new("user", text)];
+        let labels = vec![text.to_string()];
+        let response = self.achat(&messages, 0.0, Some(&labels), true, 1).await?;
+        let lps = label_token_logprobs(response.logprobs.as_deref().unwrap_or_default(), text);
+        let tokens: Vec<Token> = if lps.is_empty() {
+            vec![Token {
+                text: text.to_string(),
+                id: -1,
+            }]
+        } else {
+            lps.iter()
+                .map(|lp| Token {
+                    text: lp.token.clone(),
+                    id: -1,
+                })
+                .collect()
+        };
+
+        self.token_cache
+            .lock()
+            .unwrap()
+            .insert(text.to_string(), tokens.clone());
+
+        Ok(tokens)
     }
 }
 
@@ -306,6 +358,7 @@ impl OllamaBackendBuilder {
             extra_body: self.extra_body,
             client,
             async_client,
+            token_cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -315,7 +368,7 @@ impl OllamaBackendBuilder {
 // =========================================================================
 
 /// Build the JSON schema Ollama uses as `format` to constrain output to one of
-/// the given labels: `{"type":"object","properties":{"label":{"type":"string","enum":[...]}},"required":["label"]}`.
+/// the given labels.
 fn json_schema_enum(labels: &[String]) -> Value {
     json!({
         "type": "object",
@@ -371,132 +424,151 @@ fn parse_ollama_logprobs(arr: &[Value]) -> Vec<TokenLogprob> {
         .collect()
 }
 
-/// Render chat messages into the prompt used for Ollama `/api/generate` scoring.
+/// Extract the label-value tokens (with their logprobs) from a
+/// `{"label": "<label>"}` constrained response.
 ///
-/// Matches the OpenAI-compatible `<|system|> / <|user|> / <|assistant|>` framing
-/// so that scoring is consistent across backends.
-fn render_prompt(messages: &[ChatMessage]) -> String {
-    super::base::render_prompt(messages)
-}
+/// Robust to model-specific whitespace in the emitted JSON. The returned
+/// tokens keep their *exact* emitted strings so they match the tokens the
+/// model produces during multi-label constrained generation in `generate()`.
+///
+/// Primary strategy: reconstruct the full emitted string, locate the value
+/// span after the JSON `:` separator, and map that character span back to
+/// token indices. Falls back to JSON-skeleton filtering if the span mapping
+/// yields nothing.
+fn label_token_logprobs(logprobs: &[TokenLogprob], label: &str) -> Vec<TokenLogprob> {
+    if logprobs.is_empty() {
+        return Vec::new();
+    }
 
-/// Tokenize via `/api/tokenize`, optionally stripping a context-prefix token count.
-fn tokenize_native(
-    client: &reqwest::blocking::Client,
-    host: &str,
-    model: &str,
-    text: &str,
-    context: Option<&str>,
-) -> Result<Vec<Token>> {
-    match context {
-        None => {
-            let body = json!({ "model": model, "text": text });
-            let data = post_native_sync(client, host, "/api/tokenize", &body)?;
-            Ok(parse_ollama_tokens(&data, text))
-        }
-        Some(ctx) => {
-            let combined = format!("{ctx}{text}");
-            let body = json!({ "model": model, "text": combined });
-            let data = post_native_sync(client, host, "/api/tokenize", &body)?;
-            let ctx_body = json!({ "model": model, "text": ctx });
-            let ctx_data = post_native_sync(client, host, "/api/tokenize", &ctx_body)?;
-            let ctx_count = count_ollama_tokens(&ctx_data);
-            let mut all = parse_ollama_tokens(&data, &combined);
-            if ctx_count <= all.len() {
-                all.drain(..ctx_count);
-            }
-            Ok(all)
+    // Reconstruct the full emitted string
+    let full: String = logprobs.iter().map(|lp| lp.token.as_str()).collect();
+
+    // ---- Primary: character-offset span mapping ----
+    if let Some(result) = span_map_logprobs(&full, logprobs, label) {
+        if !result.is_empty() {
+            return result;
         }
     }
-}
 
-async fn tokenize_native_async(
-    client: &reqwest::Client,
-    host: &str,
-    model: &str,
-    text: &str,
-    context: Option<&str>,
-) -> Result<Vec<Token>> {
-    match context {
-        None => {
-            let body = json!({ "model": model, "text": text });
-            let data = post_native_async(client, host, "/api/tokenize", &body).await?;
-            Ok(parse_ollama_tokens(&data, text))
-        }
-        Some(ctx) => {
-            let combined = format!("{ctx}{text}");
-            let body = json!({ "model": model, "text": combined });
-            let data = post_native_async(client, host, "/api/tokenize", &body).await?;
-            let ctx_body = json!({ "model": model, "text": ctx });
-            let ctx_data = post_native_async(client, host, "/api/tokenize", &ctx_body).await?;
-            let ctx_count = count_ollama_tokens(&ctx_data);
-            let mut all = parse_ollama_tokens(&data, &combined);
-            if ctx_count <= all.len() {
-                all.drain(..ctx_count);
-            }
-            Ok(all)
-        }
-    }
-}
-
-fn post_native_sync(
-    client: &reqwest::blocking::Client,
-    host: &str,
-    path: &str,
-    body: &Value,
-) -> Result<Value> {
-    let url = format!("{host}{path}");
-    let response = client.post(&url).json(body).send()?;
-    response.error_for_status_ref()?;
-    Ok(response.json()?)
-}
-
-async fn post_native_async(
-    client: &reqwest::Client,
-    host: &str,
-    path: &str,
-    body: &Value,
-) -> Result<Value> {
-    let url = format!("{host}{path}");
-    let response = client.post(&url).json(body).send().await?;
-    response
-        .error_for_status_ref()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(response.json().await?)
-}
-
-/// Parse Ollama's `/api/tokenize` response.
-///
-/// Returns `{ tokens: [str...] }`; token ids are reported by some servers in a
-/// parallel `token_ids` array and are paired by index when present.
-fn parse_ollama_tokens(data: &Value, _fallback_text: &str) -> Vec<Token> {
-    let tokens = match data.get("tokens").and_then(|t| t.as_array()) {
-        Some(a) => a,
-        None => return Vec::new(),
-    };
-    let ids = data.get("token_ids").and_then(|v| v.as_array());
-    tokens
+    // ---- Fallback: drop pure JSON-structure tokens / the "label" key ----
+    logprobs
         .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            let text = t.as_str().unwrap_or("").to_string();
-            let id = ids
-                .and_then(|a| a.get(i).and_then(|v| v.as_i64()))
-                .unwrap_or(-1);
-            Token {
-                text: if text.is_empty() {
-                    format!("token_{id}")
-                } else {
-                    text
-                },
-                id,
-            }
+        .filter(|lp| {
+            let stripped = lp.token.trim();
+            let cleaned: String = stripped
+                .chars()
+                .filter(|c| !matches!(c, '"' | '{' | '}' | ':' | ' ' | '\t' | '\n'))
+                .collect();
+            !cleaned.is_empty() && stripped != "label"
         })
+        .cloned()
         .collect()
 }
 
-fn count_ollama_tokens(data: &Value) -> usize {
-    data.get("tokens")
-        .and_then(|t| t.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0)
+/// Map the character span of `label` within the full emitted string back to
+/// token indices.
+fn span_map_logprobs(
+    full: &str,
+    logprobs: &[TokenLogprob],
+    label: &str,
+) -> Option<Vec<TokenLogprob>> {
+    // Find the colon separator
+    let colon = full.find(':')?;
+    // Search for the label after the colon
+    let after_colon = &full[colon + 1..];
+    let label_rel = after_colon.find(label)?;
+    let vstart = colon + 1 + label_rel;
+    let vend = vstart + label.len();
+
+    // Map char span to token indices
+    let mut out = Vec::new();
+    let mut pos = 0; // byte offset
+    for lp in logprobs {
+        let tok_len = lp.token.len();
+        let tok_end = pos + tok_len;
+        if tok_end > vstart && pos < vend {
+            out.push(lp.clone());
+        }
+        pos = tok_end;
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_label_token_logprobs_single_token() {
+        let logprobs = vec![
+            TokenLogprob::new("{", -17.726),
+            TokenLogprob::new(" \"", -13.196),
+            TokenLogprob::new("label", 0.0),
+            TokenLogprob::new("\":", 0.0),
+            TokenLogprob::new(" \"", 0.0),
+            TokenLogprob::new("sports", -1.288),
+            TokenLogprob::new("\"", -0.001),
+            TokenLogprob::new(" }", 0.0),
+        ];
+        let out = label_token_logprobs(&logprobs, "sports");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].token, "sports");
+        assert!((out[0].logprob - (-1.288)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_label_token_logprobs_multi_token() {
+        let logprobs = vec![
+            TokenLogprob::new("{\"label\": \"", -10.0),
+            TokenLogprob::new("tech", -0.5),
+            TokenLogprob::new(" support", -0.7),
+            TokenLogprob::new("\" }", 0.0),
+        ];
+        let out = label_token_logprobs(&logprobs, "tech support");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].token, "tech");
+        assert_eq!(out[1].token, " support");
+    }
+
+    #[test]
+    fn test_label_token_logprobs_compact_json() {
+        let logprobs = vec![
+            TokenLogprob::new("{\"label\":\"", -10.0),
+            TokenLogprob::new("sports", -1.288),
+            TokenLogprob::new("\"}", 0.0),
+        ];
+        let out = label_token_logprobs(&logprobs, "sports");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].token, "sports");
+    }
+
+    #[test]
+    fn test_label_token_logprobs_fallback() {
+        // Label text never appears → primary mapping fails, fallback keeps
+        // non-structure tokens.
+        let logprobs = vec![
+            TokenLogprob::new("{", -10.0),
+            TokenLogprob::new(" \"", -10.0),
+            TokenLogprob::new("label", 0.0),
+            TokenLogprob::new("\":", 0.0),
+            TokenLogprob::new(" \"", 0.0),
+            TokenLogprob::new("sports", -1.288),
+            TokenLogprob::new("\"", 0.0),
+            TokenLogprob::new("}", 0.0),
+        ];
+        let out = label_token_logprobs(&logprobs, "missing");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].token, "sports");
+    }
+
+    #[test]
+    fn test_label_token_logprobs_empty() {
+        let out = label_token_logprobs(&[], "sports");
+        assert!(out.is_empty());
+    }
 }

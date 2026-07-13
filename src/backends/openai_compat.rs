@@ -3,9 +3,25 @@
 //! vLLM, SGLang, and llama.cpp all expose the OpenAI-compatible
 //! `/chat/completions`, `/completions`, and `/tokenize` endpoints. They differ
 //! only in (a) the field used to constrain output to a label set and (b) how
-//! the completion/prompt token boundary is found when scoring. Those
-//! differences are captured by [`Constraint`] and [`BoundaryStrategy`]; the
-//! common HTTP plumbing lives here.
+//! completion scoring works. Those differences are captured by [`Constraint`]
+//! and [`BoundaryStrategy`]; the common HTTP plumbing lives here.
+//!
+//! ## Scoring approaches
+//!
+//! - **Echo/prefill** (vLLM, SGLang): `/v1/completions` with `echo=true` to
+//!   recover the model's genuine per-token logprobs. The `/tokenize` endpoint
+//!   pinpoints the prompt/completion boundary.
+//! - **Forced constrained generation** (llama.cpp): forces the completion as
+//!   the only valid label via grammar constraint and reads back the model's
+//!   genuine per-token logprobs. llama.cpp does not support `echo=true`.
+//!
+//! ## Tokenization approach
+//!
+//! All three backends use empirical **forced constrained generation** —
+//! forcing the label as the only valid choice in a `chat()` call and reading
+//! back the emitted value tokens. This is necessary because standalone BPE
+//! tokenization produces different token boundaries than the model emits under
+//! constraint guidance. Results are memoized per label.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -14,16 +30,44 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::base::{
-    build_chat_body, build_headers, normalize_base_url, parse_chat_response,
-    parse_token_logprob_array, render_prompt, ChatMessage, ChatResponse, ScoringResponse, Token,
-    TokenLogprob,
+    build_chat_body, build_headers, normalize_base_url, parse_chat_response, render_prompt,
+    ChatMessage, ChatResponse, ScoringResponse, Token, TokenLogprob,
 };
+
+/// End-of-sequence / special tokens to filter from constrained responses.
+///
+/// Covers Llama-3, Phi, and Qwen EOS markers.
+pub const SPECIAL_TOKENS: &[&str] = &[
+    "<|im_end|>",
+    "<|endoftext|>",
+    "</s>",
+    "<|end_of_turn|>",
+    "<|eot_id|>",
+    "<|end|>",
+    "<|eom_id|>",
+];
+
+/// Filter out special / end-of-sequence tokens from a logprobs list.
+///
+/// For bare-label backends, the constraint guarantees only label text is
+/// generated, so we just need to remove special/EOS tokens and empty strings.
+pub fn filter_special_tokens(logprobs: &[TokenLogprob]) -> Vec<TokenLogprob> {
+    logprobs
+        .iter()
+        .filter(|lp| {
+            let tok = lp.token.trim();
+            !tok.is_empty() && !SPECIAL_TOKENS.contains(&lp.token.as_str())
+        })
+        .cloned()
+        .collect()
+}
 
 /// How an OpenAI-compatible backend constrains output to a label set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Constraint {
-    /// vLLM: `guided_choice` = labels.
-    GuidedChoice,
+    /// vLLM: `structured_outputs.choice` = labels (vLLM v0.12.0+, replaces
+    /// the deprecated `guided_choice`).
+    StructuredOutputsChoice,
     /// SGLang: `regex` = `(label1|label2|...)`.
     Regex,
     /// llama.cpp: `grammar` = GBNF rule `root ::= "a" | "b" | ...`.
@@ -34,9 +78,10 @@ impl Constraint {
     /// Apply this constraint to an OpenAI-compatible request body.
     pub fn apply(&self, body: &mut Value, labels: &[String]) {
         match self {
-            Constraint::GuidedChoice => {
-                body["guided_choice"] =
-                    Value::Array(labels.iter().map(|l| Value::String(l.clone())).collect());
+            Constraint::StructuredOutputsChoice => {
+                body["structured_outputs"] = serde_json::json!({
+                    "choice": labels
+                });
             }
             Constraint::Regex => {
                 let alts: Vec<String> = labels.iter().map(|l| regex_escape(l)).collect();
@@ -55,7 +100,6 @@ impl Constraint {
 
 /// Escape special characters for a Python `re`-style regex alternation.
 fn regex_escape(s: &str) -> String {
-    // vLLM/SGLang use Python-flavored regex; escape the same metacharacters.
     const SPECIAL: &[char] = &[
         '.', '^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '\\', '|', '/',
     ];
@@ -74,16 +118,15 @@ fn grammar_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// How to find the prompt/completion token boundary when scoring.
+/// How completion scoring works for this backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoundaryStrategy {
-    /// vLLM: tokenize the full prompt by id and use its token count.
+    /// vLLM: tokenize the prompt by id count; use echo/prefill.
     Ids,
-    /// SGLang: tokenize the full prompt by count and use its token count.
+    /// SGLang: tokenize the prompt by text count; use echo/prefill.
     Count,
-    /// llama.cpp: the server fills the middle via `suffix`; locate completion
-    /// tokens with a heuristic over the returned token array.
-    FillMiddle,
+    /// llama.cpp: forced constrained generation (no echo support).
+    Forced,
 }
 
 /// Shared, reusable core for an OpenAI-compatible backend.
@@ -162,195 +205,225 @@ impl OpenAICompatCore {
         Ok(parse_chat_response(&data))
     }
 
-    // ----- scoring (completions endpoint) --------------------------------
+    // ----- scoring -------------------------------------------------------
 
-    /// Build the `/completions` scoring request body.
-    fn scoring_body(&self, prompt: &str, suffix: Option<&str>) -> Value {
-        let echo = matches!(
-            self.boundary,
-            BoundaryStrategy::Ids | BoundaryStrategy::Count
-        );
-        let max_tokens = match self.boundary {
-            BoundaryStrategy::Ids => 1,
-            BoundaryStrategy::Count => 1,
-            BoundaryStrategy::FillMiddle => 0,
-        };
-        let logprobs_topn: i64 = match self.boundary {
-            BoundaryStrategy::Ids => 0,
-            BoundaryStrategy::Count => 1,
-            BoundaryStrategy::FillMiddle => 1,
-        };
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "prompt": prompt,
-            "temperature": 0.0,
-            "max_tokens": max_tokens,
-            "logprobs": logprobs_topn,
-            "echo": echo,
-        });
-        if let Some(sfx) = suffix {
-            body["suffix"] = Value::String(sfx.to_string());
-        }
-        for (k, v) in &self.extra_body {
-            body[k] = v.clone();
-        }
-        body
-    }
-
-    /// Synchronous scoring via `/completions`.
+    /// Synchronous scoring.
     pub(crate) fn post_score(
         &self,
         messages: &[ChatMessage],
         completion: &str,
     ) -> Result<ScoringResponse> {
         match self.boundary {
-            BoundaryStrategy::Ids => self.post_score_ids(messages, completion),
-            BoundaryStrategy::Count => self.post_score_count(messages, completion),
-            BoundaryStrategy::FillMiddle => self.post_score_fill_middle(messages, completion),
+            BoundaryStrategy::Ids => self.post_score_echo(messages, completion, true),
+            BoundaryStrategy::Count => self.post_score_echo(messages, completion, false),
+            BoundaryStrategy::Forced => self.post_score_forced(messages, completion),
         }
     }
 
-    /// Asynchronous scoring via `/completions`.
+    /// Asynchronous scoring.
     pub(crate) async fn apost_score(
         &self,
         messages: &[ChatMessage],
         completion: &str,
     ) -> Result<ScoringResponse> {
         match self.boundary {
-            BoundaryStrategy::Ids => self.apost_score_ids(messages, completion).await,
-            BoundaryStrategy::Count => self.apost_score_count(messages, completion).await,
-            BoundaryStrategy::FillMiddle => {
-                self.apost_score_fill_middle(messages, completion).await
-            }
+            BoundaryStrategy::Ids => self.apost_score_echo(messages, completion, true).await,
+            BoundaryStrategy::Count => self.apost_score_echo(messages, completion, false).await,
+            BoundaryStrategy::Forced => self.apost_score_forced(messages, completion).await,
         }
     }
 
-    fn post_score_ids(
+    /// Echo/prefill scoring (vLLM, SGLang).
+    ///
+    /// Uses `/v1/completions` with `echo=true` to recover the model's genuine
+    /// per-token logprobs for the label as an unexpected continuation of the
+    /// prompt. The `/tokenize` endpoint pinpoints the label-token boundary.
+    fn post_score_echo(
         &self,
         messages: &[ChatMessage],
         completion: &str,
-    ) -> Result<ScoringResponse> {
-        let prompt = format!("{}{}", render_prompt(messages), completion);
-        let prompt_token_count = self.tokenize_count_ids(&prompt)?;
-        let body = self.scoring_body(&prompt, None);
-        let data = self.post_completions_raw(&body)?;
-        let all = extract_completions_logprobs(&data);
-        let completion_logprobs = if prompt_token_count <= all.len() {
-            all[prompt_token_count..].to_vec()
-        } else {
-            all
-        };
-        Ok(ScoringResponse {
-            completion: completion.to_string(),
-            logprobs: completion_logprobs,
-            raw: data,
-        })
-    }
-
-    fn post_score_count(
-        &self,
-        messages: &[ChatMessage],
-        completion: &str,
-    ) -> Result<ScoringResponse> {
-        let prompt = format!("{}{}", render_prompt(messages), completion);
-        let prompt_token_count = self.tokenize_count_text(&prompt)?;
-        let body = self.scoring_body(&prompt, None);
-        let data = self.post_completions_raw(&body)?;
-        let all = extract_completions_logprobs(&data);
-        let completion_logprobs = if prompt_token_count <= all.len() {
-            all[prompt_token_count..].to_vec()
-        } else {
-            all
-        };
-        Ok(ScoringResponse {
-            completion: completion.to_string(),
-            logprobs: completion_logprobs,
-            raw: data,
-        })
-    }
-
-    fn post_score_fill_middle(
-        &self,
-        messages: &[ChatMessage],
-        completion: &str,
+        use_ids: bool,
     ) -> Result<ScoringResponse> {
         let prompt = render_prompt(messages);
-        let body = self.scoring_body(&prompt, Some(completion));
-        let data = self.post_completions_raw(&body)?;
+        let prompt_with_completion = format!("{prompt}{completion}");
+
+        let prompt_len = self.tokenize_count(&prompt)?;
+        let total_len = self.tokenize_count(&prompt_with_completion)?;
+
+        let url = format!("{}/completions", self.base_url);
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "prompt": prompt_with_completion,
+            "echo": true,
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "logprobs": 1,
+        });
+        for (k, v) in &self.extra_body {
+            body[k] = v.clone();
+        }
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(build_headers(&self.api_key))
+            .json(&body)
+            .send()?;
+        response.error_for_status_ref()?;
+        let data: Value = response.json()?;
+
         let all = extract_completions_logprobs(&data);
-        let completion_logprobs = find_completion_tokens(&all, completion);
+        let _ = use_ids; // both Ids and Count use the same slicing logic
+        let completion_lps = if total_len > prompt_len && total_len <= all.len() {
+            all[prompt_len..total_len].to_vec()
+        } else if prompt_len < all.len() {
+            all[prompt_len..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        if completion_lps.is_empty() {
+            anyhow::bail!("score({completion:?}): echo returned no label tokens");
+        }
+
         Ok(ScoringResponse {
             completion: completion.to_string(),
-            logprobs: completion_logprobs,
+            logprobs: completion_lps,
             raw: data,
         })
     }
 
-    async fn apost_score_ids(
+    /// Forced constrained generation scoring (llama.cpp).
+    ///
+    /// Forces `completion` as the only valid choice via the backend's
+    /// constraint mechanism and reads back the model's genuine per-token
+    /// logprobs (teacher forcing, pre-mask).
+    fn post_score_forced(
         &self,
         messages: &[ChatMessage],
         completion: &str,
     ) -> Result<ScoringResponse> {
-        let prompt = format!("{}{}", render_prompt(messages), completion);
-        let prompt_token_count = self.atokenize_count_ids(&prompt).await?;
-        let body = self.scoring_body(&prompt, None);
-        let data = self.apost_completions_raw(&body).await?;
-        let all = extract_completions_logprobs(&data);
-        let completion_logprobs = if prompt_token_count <= all.len() {
-            all[prompt_token_count..].to_vec()
-        } else {
-            all
-        };
+        let mut body = build_chat_body(
+            &self.model,
+            messages,
+            0.0,
+            true,
+            1,
+            self.max_tokens,
+            &self.extra_body,
+        );
+        let labels = vec![completion.to_string()];
+        self.constraint.apply(&mut body, &labels);
+
+        let response = self.post_chat(body)?;
+        let lps = filter_special_tokens(response.logprobs.as_deref().unwrap_or_default());
+
+        if lps.is_empty() {
+            anyhow::bail!("score({completion:?}): forced generation returned no value tokens");
+        }
+
         Ok(ScoringResponse {
             completion: completion.to_string(),
-            logprobs: completion_logprobs,
-            raw: data,
+            logprobs: lps,
+            raw: response.raw,
         })
     }
 
-    async fn apost_score_count(
+    async fn apost_score_echo(
         &self,
         messages: &[ChatMessage],
         completion: &str,
-    ) -> Result<ScoringResponse> {
-        let prompt = format!("{}{}", render_prompt(messages), completion);
-        let prompt_token_count = self.atokenize_count_text(&prompt).await?;
-        let body = self.scoring_body(&prompt, None);
-        let data = self.apost_completions_raw(&body).await?;
-        let all = extract_completions_logprobs(&data);
-        let completion_logprobs = if prompt_token_count <= all.len() {
-            all[prompt_token_count..].to_vec()
-        } else {
-            all
-        };
-        Ok(ScoringResponse {
-            completion: completion.to_string(),
-            logprobs: completion_logprobs,
-            raw: data,
-        })
-    }
-
-    async fn apost_score_fill_middle(
-        &self,
-        messages: &[ChatMessage],
-        completion: &str,
+        use_ids: bool,
     ) -> Result<ScoringResponse> {
         let prompt = render_prompt(messages);
-        let body = self.scoring_body(&prompt, Some(completion));
-        let data = self.apost_completions_raw(&body).await?;
+        let prompt_with_completion = format!("{prompt}{completion}");
+
+        let prompt_len = self.atokenize_count(&prompt).await?;
+        let total_len = self.atokenize_count(&prompt_with_completion).await?;
+
+        let url = format!("{}/completions", self.base_url);
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "prompt": prompt_with_completion,
+            "echo": true,
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "logprobs": 1,
+        });
+        for (k, v) in &self.extra_body {
+            body[k] = v.clone();
+        }
+
+        let response = self
+            .async_client
+            .post(&url)
+            .headers(build_headers(&self.api_key))
+            .json(&body)
+            .send()
+            .await?;
+        response
+            .error_for_status_ref()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let data: Value = response.json().await?;
+
         let all = extract_completions_logprobs(&data);
-        let completion_logprobs = find_completion_tokens(&all, completion);
+        let _ = use_ids;
+        let completion_lps = if total_len > prompt_len && total_len <= all.len() {
+            all[prompt_len..total_len].to_vec()
+        } else if prompt_len < all.len() {
+            all[prompt_len..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        if completion_lps.is_empty() {
+            anyhow::bail!("ascore({completion:?}): echo returned no label tokens");
+        }
+
         Ok(ScoringResponse {
             completion: completion.to_string(),
-            logprobs: completion_logprobs,
+            logprobs: completion_lps,
             raw: data,
+        })
+    }
+
+    async fn apost_score_forced(
+        &self,
+        messages: &[ChatMessage],
+        completion: &str,
+    ) -> Result<ScoringResponse> {
+        let mut body = build_chat_body(
+            &self.model,
+            messages,
+            0.0,
+            true,
+            1,
+            self.max_tokens,
+            &self.extra_body,
+        );
+        let labels = vec![completion.to_string()];
+        self.constraint.apply(&mut body, &labels);
+
+        let response = self.apost_chat(body).await?;
+        let lps = filter_special_tokens(response.logprobs.as_deref().unwrap_or_default());
+
+        if lps.is_empty() {
+            anyhow::bail!("ascore({completion:?}): forced generation returned no value tokens");
+        }
+
+        Ok(ScoringResponse {
+            completion: completion.to_string(),
+            logprobs: lps,
+            raw: response.raw,
         })
     }
 
     // ----- tokenize ------------------------------------------------------
 
-    pub(crate) fn post_tokenize(&self, text: &str) -> Result<Vec<Token>> {
-        let url = format!("{}/tokenize", self.base_url);
+    /// Count tokens via `/tokenize` endpoint (server base URL without `/v1`).
+    fn tokenize_count(&self, text: &str) -> Result<usize> {
+        let surl = server_url(&self.base_url);
+        let url = format!("{surl}/tokenize");
         let body = serde_json::json!({ "model": self.model, "prompt": text });
         let response = self
             .client
@@ -360,11 +433,16 @@ impl OpenAICompatCore {
             .send()?;
         response.error_for_status_ref()?;
         let data: Value = response.json()?;
-        Ok(parse_tokenize_response(&data))
+        Ok(data
+            .get("tokens")
+            .and_then(|t| t.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0))
     }
 
-    pub(crate) async fn apost_tokenize(&self, text: &str) -> Result<Vec<Token>> {
-        let url = format!("{}/tokenize", self.base_url);
+    async fn atokenize_count(&self, text: &str) -> Result<usize> {
+        let surl = server_url(&self.base_url);
+        let url = format!("{surl}/tokenize");
         let body = serde_json::json!({ "model": self.model, "prompt": text });
         let response = self
             .async_client
@@ -377,63 +455,18 @@ impl OpenAICompatCore {
             .error_for_status_ref()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let data: Value = response.json().await?;
-        Ok(parse_tokenize_response(&data))
-    }
-
-    fn tokenize_count_ids(&self, text: &str) -> Result<usize> {
-        // vLLM `/tokenize` returns token ids.
-        Ok(self.post_tokenize(text).map(|t| t.len()).unwrap_or(0))
-    }
-
-    fn tokenize_count_text(&self, text: &str) -> Result<usize> {
-        // SGLang `/tokenize` returns token ids (same shape).
-        Ok(self.post_tokenize(text).map(|t| t.len()).unwrap_or(0))
-    }
-
-    async fn atokenize_count_ids(&self, text: &str) -> Result<usize> {
-        Ok(self
-            .apost_tokenize(text)
-            .await
-            .map(|t| t.len())
+        Ok(data
+            .get("tokens")
+            .and_then(|t| t.as_array())
+            .map(|a| a.len())
             .unwrap_or(0))
     }
+}
 
-    async fn atokenize_count_text(&self, text: &str) -> Result<usize> {
-        Ok(self
-            .apost_tokenize(text)
-            .await
-            .map(|t| t.len())
-            .unwrap_or(0))
-    }
-
-    // ----- low-level completions post -----------------------------------
-
-    fn post_completions_raw(&self, body: &Value) -> Result<Value> {
-        let url = format!("{}/completions", self.base_url);
-        let response = self
-            .client
-            .post(&url)
-            .headers(build_headers(&self.api_key))
-            .json(body)
-            .send()?;
-        response.error_for_status_ref()?;
-        Ok(response.json()?)
-    }
-
-    async fn apost_completions_raw(&self, body: &Value) -> Result<Value> {
-        let url = format!("{}/completions", self.base_url);
-        let response = self
-            .async_client
-            .post(&url)
-            .headers(build_headers(&self.api_key))
-            .json(body)
-            .send()
-            .await?;
-        response
-            .error_for_status_ref()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(response.json().await?)
-    }
+/// Strip the `/v1` suffix to get the server base URL (for `/tokenize`).
+pub(crate) fn server_url(base_url: &str) -> String {
+    let url = base_url.trim_end_matches('/');
+    url.strip_suffix("/v1").unwrap_or(url).to_string()
 }
 
 /// Extract the per-token logprob list from a `/completions` response.
@@ -454,11 +487,11 @@ pub(crate) fn extract_completions_logprobs(data: &Value) -> Vec<TokenLogprob> {
     }
     // OpenAI chat-like nested shape: { content: [ ... ] }.
     if let Some(content) = lp.get("content") {
-        return parse_token_logprob_array(content);
+        return super::base::parse_token_logprob_array(content);
     }
     // Single-object fallback (some servers return logprobs as the array directly).
     if let Some(arr) = lp.as_array() {
-        return parse_token_logprob_array(&Value::Array(arr.clone()));
+        return super::base::parse_token_logprob_array(&Value::Array(arr.clone()));
     }
     Vec::new()
 }
@@ -496,61 +529,6 @@ fn parse_flat_completions_logprobs(lp: &Value) -> Vec<TokenLogprob> {
             logprob,
             top_logprobs: top,
         });
-    }
-    out
-}
-
-/// Heuristically locate the completion tokens within a returned token list.
-///
-/// Mirrors llama.cpp server behavior: with `suffix` + `echo`, the server
-/// returns tokens for prompt + completion; we find the index where the
-/// completion tokens begin by matching the first token whose text starts the
-/// completion (after trimming).
-fn find_completion_tokens(all: &[TokenLogprob], completion: &str) -> Vec<TokenLogprob> {
-    let target = completion.trim();
-    let start = all
-        .iter()
-        .position(|tlp| {
-            let t = tlp.token.trim();
-            !t.is_empty() && target.starts_with(t)
-        })
-        .unwrap_or(0);
-    if start <= all.len() {
-        all[start..].to_vec()
-    } else {
-        Vec::new()
-    }
-}
-
-/// Parse a `/tokenize` response into [`Token`]s.
-///
-/// Accepts `{tokens: [id...]}`, `{tokens: [str...]}`, and `{tokens: [{id,...}]}`.
-pub(crate) fn parse_tokenize_response(data: &Value) -> Vec<Token> {
-    let arr = match data.get("tokens").and_then(|t| t.as_array()) {
-        Some(a) => a,
-        None => return Vec::new(),
-    };
-    let mut out = Vec::with_capacity(arr.len());
-    for t in arr {
-        if let Some(s) = t.as_str() {
-            out.push(Token {
-                text: s.to_string(),
-                id: -1,
-            });
-        } else if let Some(i) = t.as_i64() {
-            out.push(Token {
-                text: format!("token_{i}"),
-                id: i,
-            });
-        } else if let Some(obj) = t.as_object() {
-            let id = obj.get("id").and_then(|v| v.as_i64()).unwrap_or(-1);
-            let text = obj
-                .get("token")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_else(|| format!("token_{id}"));
-            out.push(Token { text, id });
-        }
     }
     out
 }
@@ -669,9 +647,9 @@ macro_rules! impl_openai_compat_backend {
             fn tokenize(
                 &self,
                 text: &str,
-                context: Option<&str>,
+                _context: Option<&str>,
             ) -> anyhow::Result<Vec<$crate::backends::base::Token>> {
-                $crate::backends::openai_compat::tokenize_with_context(&self.core, text, context)
+                $crate::backends::openai_compat::forced_tokenize(&self.core, text)
             }
 
             async fn achat(
@@ -703,50 +681,67 @@ macro_rules! impl_openai_compat_backend {
             async fn atokenize(
                 &self,
                 text: &str,
-                context: Option<&str>,
+                _context: Option<&str>,
             ) -> anyhow::Result<Vec<$crate::backends::base::Token>> {
-                $crate::backends::openai_compat::tokenize_with_context_async(
-                    &self.core, text, context,
-                )
-                .await
+                $crate::backends::openai_compat::forced_tokenize_async(&self.core, text).await
             }
         }
     };
 }
 
-/// Shared logic for `tokenize(text, context)`: tokenize `context + text`,
-/// then strip the leading context token count.
+/// Tokenize text via empirical forced constrained generation.
 ///
-/// For the OpenAI-compatible backends the context token prefix is always
-/// prepended to the text before tokenization (no JSON wrapping).
-pub(crate) fn tokenize_with_context(
-    core: &OpenAICompatCore,
-    text: &str,
-    context: Option<&str>,
-) -> Result<Vec<Token>> {
-    match context {
-        None => core.post_tokenize(text),
-        Some(ctx) => {
-            let combined = format!("{ctx}{text}");
-            let combined_tokens = core.post_tokenize(&combined)?;
-            let ctx_tokens = core.post_tokenize(ctx).map(|t| t.len()).unwrap_or(0);
-            Ok(combined_tokens.into_iter().skip(ctx_tokens).collect())
-        }
-    }
+/// Forces `text` as the only valid label in a constrained `chat()` call and
+/// reads back the emitted value tokens. This is necessary because standalone
+/// BPE tokenization produces different token boundaries than the model emits
+/// under constraint guidance.
+pub(crate) fn forced_tokenize(core: &OpenAICompatCore, text: &str) -> Result<Vec<Token>> {
+    let messages = vec![ChatMessage::new("user", text)];
+    let labels = vec![text.to_string()];
+    let body = core.chat_body(&messages, 0.0, Some(&labels), true, 1);
+    let response = core.post_chat(body)?;
+    let lps = filter_special_tokens(response.logprobs.as_deref().unwrap_or_default());
+
+    let tokens: Vec<Token> = if lps.is_empty() {
+        vec![Token {
+            text: text.to_string(),
+            id: -1,
+        }]
+    } else {
+        lps.iter()
+            .map(|lp| Token {
+                text: lp.token.clone(),
+                id: -1,
+            })
+            .collect()
+    };
+
+    Ok(tokens)
 }
 
-pub(crate) async fn tokenize_with_context_async(
+pub(crate) async fn forced_tokenize_async(
     core: &OpenAICompatCore,
     text: &str,
-    context: Option<&str>,
 ) -> Result<Vec<Token>> {
-    match context {
-        None => core.apost_tokenize(text).await,
-        Some(ctx) => {
-            let combined = format!("{ctx}{text}");
-            let combined_tokens = core.apost_tokenize(&combined).await?;
-            let ctx_tokens = core.apost_tokenize(ctx).await.map(|t| t.len()).unwrap_or(0);
-            Ok(combined_tokens.into_iter().skip(ctx_tokens).collect())
-        }
-    }
+    let messages = vec![ChatMessage::new("user", text)];
+    let labels = vec![text.to_string()];
+    let body = core.chat_body(&messages, 0.0, Some(&labels), true, 1);
+    let response = core.apost_chat(body).await?;
+    let lps = filter_special_tokens(response.logprobs.as_deref().unwrap_or_default());
+
+    let tokens: Vec<Token> = if lps.is_empty() {
+        vec![Token {
+            text: text.to_string(),
+            id: -1,
+        }]
+    } else {
+        lps.iter()
+            .map(|lp| Token {
+                text: lp.token.clone(),
+                id: -1,
+            })
+            .collect()
+    };
+
+    Ok(tokens)
 }

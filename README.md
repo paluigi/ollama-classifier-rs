@@ -1,15 +1,20 @@
 # ollama-classifier-rs
 
-A Rust port of the Python [`ollama-classifier`](https://github.com/paluigi/ollama-classifier) library (v0.4.1) — a backend-agnostic text classifier that delegates inference to any LLM server and produces calibrated confidence scores.
+A Rust port of the Python [`ollama-classifier`](https://github.com/paluigi/ollama-classifier) library (v0.5.0) — a backend-agnostic text classifier that delegates inference to any LLM server and produces calibrated confidence scores.
 
 ## Supported Backends
 
 | Backend | Default URL | Constraint mechanism | Bare label? |
 |---------|------------|----------------------|-------------|
 | **Ollama** | `http://localhost:11434` | Native API, JSON-schema `format` enum | No (JSON-wrapped) |
-| **vLLM** | `http://localhost:8000/v1` | OpenAI-compatible, `guided_choice` | Yes |
+| **vLLM** | `http://localhost:8000/v1` | OpenAI-compatible, `structured_outputs.choice` (v0.12.0+) | Yes |
 | **SGLang** | `http://localhost:30000/v1` | OpenAI-compatible, `regex` | Yes |
 | **llama.cpp** | `http://localhost:8080/v1` | OpenAI-compatible, GBNF `grammar` | Yes |
+
+All backends use empirical **forced constrained generation** for tokenization
+(forcing the label as the only valid choice and reading back the emitted value
+tokens) and echo/prefill (vLLM, SGLang) or forced generation (Ollama, llama.cpp)
+for completion scoring. Tokenization results are memoized per label.
 
 ## Quick Start
 
@@ -17,7 +22,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ollama-classifier-rs = "0.4"
+ollama-classifier-rs = "0.5"
 ```
 
 ### Basic Usage

@@ -4,10 +4,13 @@
 //! backends (vLLM, SGLang, llama.cpp) share a common HTTP core; Ollama speaks
 //! its own native protocol.
 //!
+//! All backends use empirical forced constrained generation for tokenization
+//! and echo/prefill or forced generation for completion scoring.
+//!
 //! # Available Backends
 //!
 //! - [`OllamaBackend`] — native Ollama API
-//! - [`VLLMBackend`] — vLLM (OpenAI-compatible, `guided_choice`)
+//! - [`VLLMBackend`] — vLLM (OpenAI-compatible, `structured_outputs.choice`)
 //! - [`SGLangBackend`] — SGLang (OpenAI-compatible, `regex`)
 //! - [`LlamaCppBackend`] — llama.cpp / `llama-server` (OpenAI-compatible, GBNF `grammar`)
 

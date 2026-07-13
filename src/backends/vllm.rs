@@ -1,7 +1,12 @@
 //! vLLM inference backend.
 //!
-//! vLLM exposes an OpenAI-compatible API and supports `guided_choice` for
-//! constraining output to a label set.
+//! vLLM exposes an OpenAI-compatible API and supports
+//! `structured_outputs.choice` (vLLM v0.12.0+) for constraining output to a
+//! label set, generating bare label text with no JSON wrapper.
+//!
+//! `score()` uses echo/prefill (`/v1/completions` with `echo=true`) to recover
+//! genuine per-label logprobs. `tokenize()` uses forced constrained generation
+//! so token boundaries match the actual constrained-generation output.
 //!
 //! # Example
 //!
@@ -51,7 +56,7 @@ impl VLLMBackend {
                 timeout: Duration::from_secs(120),
                 max_tokens: 256,
                 extra_body: HashMap::new(),
-                constraint: Constraint::GuidedChoice,
+                constraint: Constraint::StructuredOutputsChoice,
                 boundary: BoundaryStrategy::Ids,
             },
         }

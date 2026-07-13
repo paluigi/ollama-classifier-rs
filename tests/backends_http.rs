@@ -30,11 +30,11 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 }
 
 // =========================================================================
-// vLLM: guided_choice constraint
+// vLLM: structured_outputs.choice constraint
 // =========================================================================
 
 #[test]
-fn test_vllm_chat_sends_guided_choice() {
+fn test_vllm_chat_sends_structured_outputs_choice() {
     let server = block_on(MockServer::start());
     block_on(
         Mock::given(method("POST"))
@@ -67,19 +67,19 @@ fn test_vllm_chat_sends_guided_choice() {
 }
 
 #[test]
-fn test_vllm_chat_body_has_guided_choice_field() {
+fn test_vllm_chat_body_has_structured_outputs_choice_field() {
     let server = block_on(MockServer::start());
     block_on(
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .and(wiremock::matchers::body_partial_json(json!({
-                "guided_choice": ["positive", "negative"]
+                "structured_outputs": {"choice": ["positive", "negative"]}
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "choices": [{"message": {"content": "positive"}, "logprobs": null}]
             })))
             .expect(1)
-            .named("guided_choice in body")
+            .named("structured_outputs.choice in body")
             .mount(&server),
     );
 
@@ -208,19 +208,28 @@ fn test_ollama_chat_sends_json_schema_format() {
 }
 
 #[test]
-fn test_ollama_score_uses_generate_endpoint() {
+fn test_ollama_score_uses_forced_constrained_chat() {
     let server = block_on(MockServer::start());
     block_on(
         Mock::given(method("POST"))
-            .and(path("/api/generate"))
+            .and(path("/api/chat"))
             .and(wiremock::matchers::body_partial_json(json!({
-                "suffix": "positive",
-                "options": {"num_predict": 0}
+                "format": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string", "enum": ["positive"]}
+                    },
+                    "required": ["label"]
+                },
+                "logprobs": 1
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "{\"label\": \"positive\"}"},
                 "logprobs": [
+                    {"token": "{\"label\": \"", "logprob": -10.0},
                     {"token": "pos", "logprob": -0.5},
-                    {"token": "itive", "logprob": -0.3}
+                    {"token": "itive", "logprob": -0.3},
+                    {"token": "\"}", "logprob": -0.0}
                 ]
             })))
             .expect(1)
@@ -233,21 +242,36 @@ fn test_ollama_score_uses_generate_endpoint() {
     let resp = block_on(backend.ascore(&messages, "positive")).unwrap();
 
     assert_eq!(resp.completion, "positive");
+    // label_token_logprobs should extract the two value tokens
     assert_eq!(resp.logprobs.len(), 2);
+    assert_eq!(resp.logprobs[0].token, "pos");
     assert!((resp.logprobs[0].logprob - (-0.5)).abs() < 1e-9);
 }
 
 #[test]
-fn test_ollama_tokenize_endpoint() {
+fn test_ollama_tokenize_uses_forced_constrained_chat() {
     let server = block_on(MockServer::start());
     block_on(
         Mock::given(method("POST"))
-            .and(path("/api/tokenize"))
-            .and(wiremock::matchers::body_partial_json(
-                json!({"text": "hello"}),
-            ))
+            .and(path("/api/chat"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "format": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string", "enum": ["hello"]}
+                    },
+                    "required": ["label"]
+                },
+                "logprobs": 1
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "tokens": ["he", "llo"]
+                "message": {"role": "assistant", "content": "{\"label\": \"hello\"}"},
+                "logprobs": [
+                    {"token": "{\"label\": \"", "logprob": -0.0},
+                    {"token": "he", "logprob": -0.1},
+                    {"token": "llo", "logprob": -0.2},
+                    {"token": "\"}", "logprob": -0.0}
+                ]
             })))
             .expect(1)
             .mount(&server),
