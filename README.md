@@ -1,6 +1,6 @@
 # ollama-classifier-rs
 
-A Rust port of the Python [`ollama-classifier`](https://github.com/paluigi/ollama-classifier) library (v0.5.0) — a backend-agnostic text classifier that delegates inference to any LLM server and produces calibrated confidence scores.
+A Rust port of the Python [`ollama-classifier`](https://github.com/paluigi/ollama-classifier) library (v0.6.0) — a backend-agnostic text classifier that delegates inference to any LLM server and produces calibrated confidence scores.
 
 ## Supported Backends
 
@@ -22,7 +22,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ollama-classifier-rs = "0.5"
+ollama-classifier-rs = "0.6"
 ```
 
 ### Basic Usage
@@ -49,13 +49,18 @@ fn main() -> ollama_classifier_rs::Result<()> {
 }
 ```
 
-### Adaptive Generation (`generate`)
+### Hierarchical Generation (`generate`)
 
-`generate` uses constrained generation with an adaptive trie-based scoring
-algorithm. The `max_calls` budget controls the accuracy/cost trade-off:
+`generate` uses hierarchical constrained generation. The first call constrains
+the model to all labels and produces an internally consistent probability
+distribution. Supplementary calls (when `max_calls > 1`) resolve label clusters
+by **reproportioning** probability mass *within* a cluster — never changing
+between-group totals, so accuracy never degrades as the call budget grows.
+
+The `max_calls` budget controls the accuracy/cost trade-off:
 
 ```rust
-// Single fast call — partial/approximate scoring
+// Single call, no cluster resolution (default)
 let result = classifier.generate(
     "This movie was okay.",
     vec!["positive", "negative", "neutral"],
@@ -63,7 +68,15 @@ let result = classifier.generate(
     Some(1),
 )?;
 
-// Fully exact — resolves all ambiguity (up to N calls)
+// Adaptive: resolve label clusters up to 3 calls
+let result = classifier.generate(
+    "This movie was okay.",
+    vec!["positive", "negative", "neutral"],
+    None,
+    Some(3),
+)?;
+
+// Exact: resolve all clusters recursively
 let result = classifier.generate(
     "This movie was okay.",
     vec!["positive", "negative", "neutral"],
@@ -171,7 +184,7 @@ let classifier = LLMClassifier::with_max_workers(backend, 8);
 | Method | Calls | Description |
 |--------|-------|-------------|
 | [`classify`](LLMClassifier::classify) | N (one per label) | Multi-call completion scoring with geometric-mean normalization. Exact. |
-| [`generate`](LLMClassifier::generate) | ≤ `max_calls` | Adaptive trie-masked constrained generation. `max_calls=1` is fast/approximate; `None` is exact. |
+| [`generate`](LLMClassifier::generate) | ≤ `max_calls` | Hierarchical constrained generation with reproportioning. `max_calls=1` is a single call; `None` resolves all clusters. |
 | `batch_*` | N or ≤max_calls per text | Concurrent batch variants of the above. |
 | `a*` (async) | Same | Async versions of all methods. |
 

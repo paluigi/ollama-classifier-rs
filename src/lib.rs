@@ -16,10 +16,14 @@
 //! - **[`classify`][crate::LLMClassifier::classify]** — multi-call completion
 //!   scoring. Makes one backend call per label and normalizes the
 //!   geometric-mean logprobs with a stable softmax. Exact, N calls for N labels.
-//! - **[`generate`][crate::LLMClassifier::generate]** — adaptive
-//!   constrained-generation scoring. Tokenizes labels, builds a trie, and
-//!   resolves ambiguity with a bounded number of constrained calls controlled
-//!   by `max_calls` (`1` = single fast approximate call, `None` = fully exact).
+//! - **[`generate`][crate::LLMClassifier::generate]** — hierarchical
+//!   constrained-generation scoring. The first call constrains the model to all
+//!   labels and produces an internally consistent probability distribution.
+//!   Supplementary calls (when `max_calls > 1`) resolve label clusters by
+//!   reproportioning probability mass *within* a cluster — never changing
+//!   between-group totals, so accuracy never degrades as the call budget grows.
+//!   `max_calls` controls the budget (`1` = single call, `None` = resolve all
+//!   clusters).
 //!
 //! Sync, async (`a*`), and batch (`batch_*` / `abatch_*`) variants are provided.
 
