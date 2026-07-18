@@ -194,16 +194,20 @@ pub fn score_labels_from_winning_path(
         .unwrap_or_default();
 
     for (label, seq) in token_sequences {
-        let dp = divergence_point(seq, &winning);
-        if dp == 0 {
+        let d = divergence_point(seq, &winning);
+        // Score tokens at positions 0..=d (inclusive of the divergence point,
+        // where the step logprobs contain all candidate tokens). This matches
+        // ollama-classifier v0.6.0.
+        let n_scoring = (d + 1).min(seq.len()).min(step_logprobs.len());
+        if n_scoring == 0 {
             scores.insert(label.clone(), f64::NEG_INFINITY);
             continue;
         }
         // Walk the winning path and collect the logprob of this label's token
         // at each shared position. Positions where the label's token isn't in
         // the candidate set contribute -inf.
-        let mut lps = Vec::with_capacity(dp);
-        for (i, tok) in seq.iter().take(dp).enumerate() {
+        let mut lps = Vec::with_capacity(n_scoring);
+        for (i, tok) in seq.iter().take(n_scoring).enumerate() {
             let lp = step_logprobs
                 .get(i)
                 .and_then(|m| m.get(tok).copied())
@@ -216,8 +220,12 @@ pub fn score_labels_from_winning_path(
     scores
 }
 
-/// Per-label number of tokens that would be scored against the winning path
-/// (i.e. the divergence-point length for each label).
+/// Per-label number of tokens that would be scored against the winning path.
+///
+/// Returns `divergence_point + 1` (capped at the label's token length): at the
+/// divergence position, the step logprobs contain all candidate tokens
+/// (including the non-winning label's token), so that position can be scored
+/// too. This matches ollama-classifier v0.6.0.
 pub fn get_scored_lengths(
     token_sequences: &HashMap<String, Vec<String>>,
     winning_label: &str,
@@ -228,7 +236,10 @@ pub fn get_scored_lengths(
         .unwrap_or_default();
     token_sequences
         .iter()
-        .map(|(label, seq)| (label.clone(), divergence_point(seq, &winning)))
+        .map(|(label, seq)| {
+            let d = divergence_point(seq, &winning);
+            (label.clone(), (d + 1).min(seq.len()))
+        })
         .collect()
 }
 
@@ -386,12 +397,12 @@ mod tests {
             HashMap::from([("x".to_string(), -0.5), ("y".to_string(), -2.0)]),
         ];
         let scores = score_labels_from_winning_path(&seq, "cat", &steps);
-        // cat shares full path [a,x]: (-1.0 + -0.5)/2 = -0.75
+        // cat: identical to winner, d=2, n_scoring=min(3,2,2)=2 → (a,x): (-1.0 + -0.5)/2 = -0.75
         assert!((scores["cat"] - (-0.75)).abs() < 1e-9);
-        // car diverges at index 1: only [a] -> -1.0
-        assert!((scores["car"] - (-1.0)).abs() < 1e-9);
-        // dog diverges at index 0: no shared tokens -> dp=0 -> -inf
-        assert!(scores["dog"] == f64::NEG_INFINITY);
+        // car: diverges at index 1, d=1, n_scoring=min(2,2,2)=2 → tokens (a,y): (-1.0 + -2.0)/2 = -1.5
+        assert!((scores["car"] - (-1.5)).abs() < 1e-9);
+        // dog: diverges at index 0, d=0, n_scoring=min(1,2,2)=1 → token (b): -3.0
+        assert!((scores["dog"] - (-3.0)).abs() < 1e-9);
     }
 
     #[test]
@@ -400,8 +411,10 @@ mod tests {
         seq.insert("cat".to_string(), vec!["a".to_string(), "x".to_string()]);
         seq.insert("car".to_string(), vec!["a".to_string(), "y".to_string()]);
         let lens = get_scored_lengths(&seq, "cat");
+        // cat: identical → d=2 → min(3, 2) = 2
         assert_eq!(lens["cat"], 2);
-        assert_eq!(lens["car"], 1);
+        // car: diverges at index 1 → d=1 → min(2, 2) = 2 (d+1, capped at len)
+        assert_eq!(lens["car"], 2);
     }
 
     #[test]

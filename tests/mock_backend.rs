@@ -15,14 +15,26 @@ use ollama_classifier_rs::backends::base::{
 use ollama_classifier_rs::{Choices, ClassificationResult, LLMClassifier};
 
 /// A mock backend that returns scripted responses and counts calls.
+///
+/// Supports two chat-response modes:
+/// - **Fixed mode** (via `with_chat`): always returns the same winner and
+///   step-logprob map regardless of `constrain_labels`. Used by the original
+///   v0.5.0 tests.
+/// - **Map mode** (via `with_chat_map`): looks up the winner as
+///   `constrain_labels[0]` and returns the per-winner step-logprob map from
+///   `chat_step_logprobs_map`. Mirrors the Python `MockBackend` and lets the
+///   reproportion regression tests exercise the cluster-resolution path.
 struct MockBackend {
     bare_label: bool,
     /// Scripted per-label logprobs for `score` calls: label -> Vec<logprob>.
     score_logprobs: Mutex<HashMap<String, Vec<f64>>>,
-    /// Scripted label returned by `chat` when constrained.
+    /// Fixed-mode: scripted label returned by `chat`.
     chat_label: String,
-    /// Scripted step logprobs returned by `chat` (per-position top-logprobs).
+    /// Fixed-mode: scripted step logprobs returned by `chat`.
     chat_step_logprobs: Vec<HashMap<String, f64>>,
+    /// Map-mode: per-winner step logprob maps. When non-empty, `chat` returns
+    /// `constrain_labels[0]` as the winner and looks up its step logprobs here.
+    chat_step_logprobs_map: HashMap<String, Vec<HashMap<String, f64>>>,
     /// Token sequences per label (for `tokenize`).
     token_sequences: HashMap<String, Vec<String>>,
     score_calls: AtomicUsize,
@@ -36,6 +48,7 @@ impl MockBackend {
             score_logprobs: Mutex::new(HashMap::new()),
             chat_label: String::new(),
             chat_step_logprobs: Vec::new(),
+            chat_step_logprobs_map: HashMap::new(),
             token_sequences: HashMap::new(),
             score_calls: AtomicUsize::new(0),
             chat_calls: AtomicUsize::new(0),
@@ -55,10 +68,45 @@ impl MockBackend {
         self
     }
 
+    /// Fixed-mode chat scripting: always returns `label` as the winner with
+    /// the given per-position top-logprob map.
     fn with_chat(mut self, label: &str, step_logprobs: Vec<HashMap<String, f64>>) -> Self {
         self.chat_label = label.to_string();
         self.chat_step_logprobs = step_logprobs;
         self
+    }
+
+    /// Map-mode chat scripting: the winner is `constrain_labels[0]` and its
+    /// step logprobs are looked up in this map by winner name.
+    fn with_chat_map(mut self, map: HashMap<String, Vec<HashMap<String, f64>>>) -> Self {
+        self.chat_step_logprobs_map = map;
+        self
+    }
+
+    /// Resolve the winner and step logprobs for a `chat` call.
+    ///
+    /// In map-mode the winner is `constrain_labels[0]` (matching the Python
+    /// `MockBackend`); in fixed-mode the winner is the scripted `chat_label`.
+    fn resolve_chat(
+        &self,
+        constrain_labels: Option<&[String]>,
+    ) -> (String, Vec<HashMap<String, f64>>) {
+        if !self.chat_step_logprobs_map.is_empty() {
+            // Map mode: winner = first constrained label (or first known key).
+            let winner = constrain_labels
+                .and_then(|l| l.first().cloned())
+                .or_else(|| self.chat_step_logprobs_map.keys().next().cloned())
+                .unwrap_or_default();
+            let step_lps = self
+                .chat_step_logprobs_map
+                .get(&winner)
+                .cloned()
+                .unwrap_or_default();
+            (winner, step_lps)
+        } else {
+            // Fixed mode.
+            (self.chat_label.clone(), self.chat_step_logprobs.clone())
+        }
     }
 }
 
@@ -78,19 +126,20 @@ impl LLMBackend for MockBackend {
         &self,
         _messages: &[ChatMessage],
         _temperature: f64,
-        _constrain_labels: Option<&[String]>,
+        constrain_labels: Option<&[String]>,
         logprobs: bool,
         _top_logprobs: u32,
     ) -> anyhow::Result<ChatResponse> {
         self.chat_calls.fetch_add(1, Ordering::SeqCst);
+        let (winner, step_logprobs) = self.resolve_chat(constrain_labels);
         let content = if self.bare_label {
-            self.chat_label.clone()
+            winner.clone()
         } else {
-            format!("{{\"label\": \"{}\"}}", self.chat_label)
+            format!("{{\"label\": \"{}\"}}", winner)
         };
         let logprobs_data = if logprobs {
             Some(
-                self.chat_step_logprobs
+                step_logprobs
                     .iter()
                     .map(|step| {
                         // The emitted token is the argmax of each step.
@@ -113,7 +162,7 @@ impl LLMBackend for MockBackend {
         };
         Ok(ChatResponse {
             content,
-            label: self.chat_label.clone(),
+            label: winner,
             logprobs: logprobs_data,
             raw: serde_json::json!({}),
         })
@@ -299,9 +348,9 @@ fn test_generate_single_call_picks_winning_label() {
 fn test_generate_exact_resolves_shared_prefix() {
     // Two labels sharing a prefix: "cat" vs "car" — both start with "ca".
     // With max_calls=None, the adaptive loop resolves the divergence. The
-    // winning constrained label is "cat". "car" diverges at index 2 (t vs r),
-    // so only its first 2 tokens ("c","a") are scored against the winning path
-    // → coverage 2/3 ≈ 0.667 for "car", 1.0 for "cat".
+    // winning constrained label is "cat". "car" diverges at index 2 (t vs r).
+    // With the v0.6.0 d+1 scoring, "car" is scored up to and including the
+    // divergence position → 3/3 tokens scored → coverage 1.0.
     let backend = MockBackend::new(true)
         .with_tokens(
             "cat",
@@ -329,11 +378,11 @@ fn test_generate_exact_resolves_shared_prefix() {
     assert_eq!(result.prediction, "cat");
     // "cat" (the winner) is fully covered: 3/3 tokens scored.
     assert!((result.coverage["cat"] - 1.0).abs() < 1e-9);
-    // "car" diverges from the winning path at index 2 → only 2 of 3 tokens
-    // scored → coverage 2/3.
-    assert!((result.coverage["car"] - (2.0 / 3.0)).abs() < 1e-9);
-    // Since at least one label is not fully covered, the result is approximate.
-    assert!(result.approximate);
+    // "car" diverges at index 2 but the divergence position is scored too
+    // (d+1=3, capped at len 3) → coverage 3/3 = 1.0.
+    assert!((result.coverage["car"] - 1.0).abs() < 1e-9);
+    // Both labels fully covered → not approximate.
+    assert!(!result.approximate);
 }
 
 #[test]
@@ -345,6 +394,9 @@ fn test_generate_prediction_is_softmax_argmax() {
     // after normalization "ab" can win. The key assertion is that the
     // algorithm re-evaluates all labels rather than blindly trusting the
     // constrained output.
+    //
+    // With v0.6.0 d+1 scoring, both labels are fully covered (divergence at
+    // index 1, d+1=2 = full length).
     let backend = MockBackend::new(true)
         .with_tokens("aa", vec!["a".to_string(), "a".to_string()])
         .with_tokens("ab", vec!["a".to_string(), "b".to_string()])
@@ -363,11 +415,9 @@ fn test_generate_prediction_is_softmax_argmax() {
 
     assert_eq!(result.method, "adaptive_generate");
     assert_eq!(result.n_calls, 1);
-    // The winner "aa" is fully covered (2/2 tokens on the winning path). "ab"
-    // diverges from the winning path "aa" at index 1 (a vs b) → only 1 of 2
-    // tokens scored → coverage 0.5.
+    // Both labels fully covered (d+1 scoring).
     assert!((result.coverage["aa"] - 1.0).abs() < 1e-9);
-    assert!((result.coverage["ab"] - 0.5).abs() < 1e-9);
+    assert!((result.coverage["ab"] - 1.0).abs() < 1e-9);
     // The prediction is a valid label and the probabilities sum to 1.
     assert!(result.prediction == "aa" || result.prediction == "ab");
     let total: f64 = result.probabilities.values().sum();
@@ -441,6 +491,189 @@ fn test_classification_result_serialization() {
     assert_eq!(v["method"], "multi_call");
     assert_eq!(v["n_calls"], 2);
     assert_eq!(v["probabilities"]["pos"], 0.9);
+}
+
+// =========================================================================
+// TestMaxCallsMonotonicity — regression tests for hierarchical reproportion.
+// Ported from ollama-classifier v0.6.0 tests/test_classifier.py.
+//
+// The original cluster-resolution code mixed logprobs from different
+// constraint contexts into a single geometric mean, which could DECREASE
+// accuracy as max_calls increased. The fix uses reproportioning:
+// supplementary calls only redistribute probability mass *within* a cluster,
+// never changing between-group totals.
+// =========================================================================
+
+/// Shared fixture for the monotonicity tests.
+///
+/// Scenario: 3 labels with a real multi-label cluster.
+///   A = [s, a]               (2 tokens)
+///   B = [s, b1, b2, b3]      (4 tokens, diverges from A at pos 2)
+///   C = [s, b1, c2, c3]      (4 tokens, shares [s, b1] with B at pos 1-2)
+///
+/// After the first call (winner A), B and C share the scored prefix [s, b1]
+/// → they form a multi-label cluster → a reproportioning call is made.
+fn monotonicity_backend() -> MockBackend {
+    let token_sequences: HashMap<String, Vec<String>> = HashMap::from([
+        ("A".to_string(), vec!["s".to_string(), "a".to_string()]),
+        (
+            "B".to_string(),
+            vec![
+                "s".to_string(),
+                "b1".to_string(),
+                "b2".to_string(),
+                "b3".to_string(),
+            ],
+        ),
+        (
+            "C".to_string(),
+            vec![
+                "s".to_string(),
+                "b1".to_string(),
+                "c2".to_string(),
+                "c3".to_string(),
+            ],
+        ),
+    ]);
+    let step_logprobs_map: HashMap<String, Vec<HashMap<String, f64>>> = HashMap::from([
+        // Winner A (3-way call): B and C diverge at pos 2.
+        (
+            "A".to_string(),
+            vec![
+                HashMap::from([("s".to_string(), -0.2)]),
+                HashMap::from([("a".to_string(), -0.1), ("b1".to_string(), -0.8)]),
+            ],
+        ),
+        // Winner B (subset call on {B, C}): fully resolves B.
+        (
+            "B".to_string(),
+            vec![
+                HashMap::from([("s".to_string(), -0.2)]),
+                HashMap::from([("b1".to_string(), -0.8)]),
+                HashMap::from([("b2".to_string(), -0.3)]),
+                HashMap::from([("b3".to_string(), -0.3)]),
+            ],
+        ),
+        // Winner C (subset call on {C}): fully resolves C.
+        (
+            "C".to_string(),
+            vec![
+                HashMap::from([("s".to_string(), -0.2)]),
+                HashMap::from([("b1".to_string(), -0.8)]),
+                HashMap::from([("c2".to_string(), -2.0)]),
+                HashMap::from([("c3".to_string(), -2.0)]),
+            ],
+        ),
+    ]);
+    MockBackend::new(true)
+        .with_tokens("A", token_sequences["A"].clone())
+        .with_tokens("B", token_sequences["B"].clone())
+        .with_tokens("C", token_sequences["C"].clone())
+        .with_chat_map(step_logprobs_map)
+}
+
+#[test]
+fn test_max_calls_does_not_flip_prediction() {
+    // generate(max_calls=None) must not produce a worse prediction than
+    // generate(max_calls=1). The model's true preference is A > B > C, and
+    // greedy constrained generation picks A. Reproportioning must not inflate
+    // B's probability above A's.
+    for max_calls in [Some(1usize), Some(2), Some(3), None] {
+        let classifier = LLMClassifier::new(monotonicity_backend());
+        let result = classifier
+            .generate("test", vec!["A", "B", "C"], None, max_calls)
+            .unwrap();
+        assert_eq!(
+            result.prediction, "A",
+            "max_calls={:?}: expected 'A', got '{}'",
+            max_calls, result.prediction
+        );
+        // Probabilities must always sum to 1.0.
+        let total: f64 = result.probabilities.values().sum();
+        assert!(
+            (total - 1.0).abs() < 1e-10,
+            "max_calls={:?}: probabilities must sum to 1.0 (got {})",
+            max_calls,
+            total
+        );
+    }
+}
+
+#[test]
+fn test_reproportion_preserves_group_mass() {
+    // The sum of cluster probabilities is invariant under reproportioning.
+    // Concretely: A's probability must not decrease when max_calls grows, and
+    // the total P(B)+P(C) must be preserved.
+    let clf1 = LLMClassifier::new(monotonicity_backend());
+    let r1 = clf1
+        .generate("test", vec!["A", "B", "C"], None, Some(1))
+        .unwrap();
+
+    let clf2 = LLMClassifier::new(monotonicity_backend());
+    let r2 = clf2
+        .generate("test", vec!["A", "B", "C"], None, None)
+        .unwrap();
+
+    // Both distributions sum to 1.0.
+    let total1: f64 = r1.probabilities.values().sum();
+    let total2: f64 = r2.probabilities.values().sum();
+    assert!((total1 - 1.0).abs() < 1e-10);
+    assert!((total2 - 1.0).abs() < 1e-10);
+
+    // A's probability must not decrease under full resolution.
+    assert!(
+        r2.probabilities["A"] >= r1.probabilities["A"] - 1e-10,
+        "A's probability decreased: mc=1={}, mc=None={}",
+        r1.probabilities["A"],
+        r2.probabilities["A"]
+    );
+
+    // Between-group mass P(B)+P(C) is preserved by reproportioning.
+    let group1 = r1.probabilities["B"] + r1.probabilities["C"];
+    let group2 = r2.probabilities["B"] + r2.probabilities["C"];
+    assert!(
+        (group2 - group1).abs() < 1e-9,
+        "P(B)+P(C) changed: mc=1={}, mc=None={}",
+        group1,
+        group2
+    );
+}
+
+#[test]
+fn test_single_token_labels_need_no_resolution_calls() {
+    // When all labels are single-token, max_calls has no effect — there are
+    // no clusters to resolve.
+    for max_calls in [Some(1usize), Some(5), None] {
+        let classifier = LLMClassifier::new(monotonicity_backend_for_single_token());
+        let result = classifier
+            .generate(
+                "test",
+                vec!["positive", "negative", "neutral"],
+                None,
+                max_calls,
+            )
+            .unwrap();
+        assert_eq!(result.prediction, "positive");
+        assert_eq!(result.n_calls, 1, "no resolution calls needed");
+        assert!(!result.approximate);
+    }
+}
+
+/// Helper: a fresh backend for the single-token monotonicity scenario.
+fn monotonicity_backend_for_single_token() -> MockBackend {
+    let step_logprobs_map: HashMap<String, Vec<HashMap<String, f64>>> = HashMap::from([(
+        "positive".to_string(),
+        vec![HashMap::from([
+            ("positive".to_string(), -0.3),
+            ("negative".to_string(), -1.5),
+            ("neutral".to_string(), -2.8),
+        ])],
+    )]);
+    MockBackend::new(true)
+        .with_tokens("positive", vec!["positive".to_string()])
+        .with_tokens("negative", vec!["negative".to_string()])
+        .with_tokens("neutral", vec!["neutral".to_string()])
+        .with_chat_map(step_logprobs_map)
 }
 
 // Re-export Choices so the unused import warning doesn't fire on doc builds.

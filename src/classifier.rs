@@ -1,4 +1,4 @@
-//! Backend-agnostic LLM classifier with adaptive scoring.
+//! Backend-agnostic LLM classifier with hierarchical constrained scoring.
 //!
 //! Provides [`LLMClassifier`], a backend-agnostic classifier with two
 //! confidence-scoring paths:
@@ -6,10 +6,14 @@
 //! - [`classify`](LLMClassifier::classify) — multi-call completion scoring:
 //!   one backend call per label, geometric-mean logprobs normalized with a
 //!   stable softmax. Exact; N calls for N labels.
-//! - [`generate`](LLMClassifier::generate) — adaptive constrained-generation
-//!   scoring: tokenizes labels, builds a trie, and resolves ambiguity with a
-//!   bounded number of constrained calls (`max_calls`: `1` = fast approximate,
-//!   `None` = fully exact).
+//! - [`generate`](LLMClassifier::generate) — hierarchical constrained
+//!   generation. A single constrained call produces a probability distribution
+//!   over all labels using divergence-aware logprobs from the winning path.
+//!   When `max_calls > 1`, supplementary calls resolve clusters of labels that
+//!   share a token prefix but diverge from the winner — but only to
+//!   **reproportion** probability mass *within* each cluster, never changing
+//!   between-group totals. This guarantees accuracy never degrades as the call
+//!   budget grows.
 //!
 //! Sync, async (`a*`), and batch (`batch_*` / `abatch_*`) variants are
 //! provided.
@@ -43,8 +47,8 @@ use anyhow::Result;
 use crate::backends::base::{ChatMessage, LLMBackend};
 use crate::prompts::{build_classification_prompt, get_choice_labels};
 use crate::scoring::{
-    geometric_mean_logprob, identify_unresolved_clusters, score_labels_from_winning_path,
-    stable_softmax, Cluster, LabelTrie,
+    geometric_mean_logprob, get_scored_lengths, identify_unresolved_clusters, stable_softmax,
+    LabelTrie,
 };
 use crate::types::{Choices, ClassificationResult};
 
@@ -121,6 +125,7 @@ impl<B: LLMBackend> LLMClassifier<B> {
         let messages = Self::to_messages(&system, &user);
 
         let mut raw_scores: HashMap<String, f64> = HashMap::new();
+        let mut logprob_details: HashMap<String, Vec<f64>> = HashMap::new();
         for label in &labels {
             let lps = match self.backend.score(&messages, label) {
                 Ok(resp) => resp.logprobs.iter().map(|t| t.logprob).collect::<Vec<_>>(),
@@ -128,8 +133,9 @@ impl<B: LLMBackend> LLMClassifier<B> {
             };
             let score = geometric_mean_logprob(&lps).unwrap_or(f64::NEG_INFINITY);
             raw_scores.insert(label.clone(), score);
+            logprob_details.insert(label.clone(), lps);
         }
-        Ok(self.finalize_multi_call(raw_scores, labels.len()))
+        Ok(self.finalize_multi_call(raw_scores, logprob_details, labels.len()))
     }
 
     /// Asynchronous [`classify`](LLMClassifier::classify). Runs all per-label
@@ -155,39 +161,74 @@ impl<B: LLMBackend> LLMClassifier<B> {
                     Err(_) => Vec::new(),
                 };
                 let score = geometric_mean_logprob(&lps).unwrap_or(f64::NEG_INFINITY);
-                (label, score)
+                (label, score, lps)
             });
         }
         let results = futures::future::join_all(futs).await;
-        let raw_scores: HashMap<String, f64> = results.into_iter().collect();
-        Ok(self.finalize_multi_call(raw_scores, labels.len()))
+        let mut raw_scores: HashMap<String, f64> = HashMap::new();
+        let mut logprob_details: HashMap<String, Vec<f64>> = HashMap::new();
+        for (label, score, lps) in results {
+            raw_scores.insert(label.clone(), score);
+            logprob_details.insert(label, lps);
+        }
+        Ok(self.finalize_multi_call(raw_scores, logprob_details, labels.len()))
     }
 
     fn finalize_multi_call(
         &self,
         raw_scores: HashMap<String, f64>,
+        logprob_details: HashMap<String, Vec<f64>>,
         n_calls: usize,
     ) -> ClassificationResult {
         let probabilities = stable_softmax(&raw_scores).unwrap_or_default();
         let prediction = argmax(&probabilities).unwrap_or_default();
         let confidence = probabilities.get(&prediction).copied().unwrap_or(0.0);
-        ClassificationResult::new_multi_call(prediction, confidence, probabilities, n_calls as i64)
+        let mut result = ClassificationResult::new_multi_call(
+            prediction,
+            confidence,
+            probabilities,
+            n_calls as i64,
+        );
+        // Populate raw_response with per-label token logprobs for debugging.
+        let raw = serde_json::json!({
+            "logprobs": raw_scores,
+            "token_logprobs": logprob_details,
+        });
+        if let serde_json::Value::Object(map) = raw {
+            result.raw_response = map;
+        }
+        result
     }
 
     // ======================================================================
-    // generate — adaptive trie-masked constrained generation
+    // generate — hierarchical constrained generation
     // ======================================================================
 
-    /// Classify text via adaptive constrained-generation scoring.
+    /// Classify text via hierarchical constrained-generation scoring.
     ///
-    /// Tokenizes each label, builds a trie, and makes constrained generation
-    /// calls (with per-position top-logprobs) to score each label against the
-    /// winning path. The `max_calls` budget bounds the number of backend
-    /// calls:
-    /// - `Some(1)` (default) — a single fast call; scoring is partial /
-    ///   approximate when labels share token prefixes.
-    /// - `Some(k)` — up to `k` adaptive calls to resolve ambiguity.
-    /// - `None` — fully recursive until exact.
+    /// **Call 1** constrains the model to all labels and returns
+    /// `top_logprobs` at every generated position. Labels are scored up to
+    /// their divergence point from the winning path using the geometric mean
+    /// of available token logprobs, then a softmax produces the initial
+    /// probability distribution. All logprobs come from the same constraint
+    /// context, so the distribution is internally consistent.
+    ///
+    /// **Calls 2…max_calls** resolve *clusters*: groups of ≥2 non-winning
+    /// labels that share a scored prefix but diverge from the winner (and from
+    /// each other) at a later position. For each cluster, a constrained call
+    /// over only the cluster's labels produces divergence-based logprobs whose
+    /// softmax gives **relative weights** summing to 1. The cluster's total
+    /// probability mass (summed from the initial distribution) is then
+    /// redistributed among its members according to these relative weights.
+    /// This **reproportioning** never changes the total probability of any
+    /// group — it only sharpens the distribution *within* a group — so
+    /// accuracy can only improve or stay the same, never degrade.
+    ///
+    /// The `max_calls` budget bounds the number of backend calls:
+    /// - `Some(1)` (default) — a single call, no cluster resolution.
+    /// - `Some(k)` — up to `k` calls; resolves clusters adaptively.
+    /// - `None` — resolves all clusters recursively (exact for non-winning
+    ///   labels; equivalent to `classify` when every label is fully resolved).
     pub fn generate(
         &self,
         text: &str,
@@ -277,7 +318,18 @@ impl<B: LLMBackend> LLMClassifier<B> {
         }
     }
 
-    /// Core adaptive loop shared by the sync and async paths.
+    /// Core hierarchical-reproportion loop shared by the sync and async paths.
+    ///
+    /// Algorithm (mirrors ollama-classifier v0.6.0):
+    /// 1. First constrained call over ALL labels → initial probability
+    ///    distribution (all logprobs from the same constraint context).
+    /// 2. Identify clusters of ≥2 labels that share a scored prefix but
+    ///    diverge from the winner.
+    /// 3. For each cluster: subset call → divergence-based relative weights
+    ///    (softmax of geometric-mean scores) → redistribute the cluster's
+    ///    total probability mass among its members. Between-group totals are
+    ///    locked.
+    /// 4. Single-label clusters are skipped (nothing to reproportion).
     fn run_adaptive(
         &self,
         messages: &[ChatMessage],
@@ -293,108 +345,198 @@ impl<B: LLMBackend> LLMClassifier<B> {
         }
         let k = Self::top_logprobs_budget(&trie);
 
-        // Per-label accumulated step logprobs (over the winning path).
-        let mut all_step_logprobs: HashMap<String, Vec<f64>> = HashMap::new();
-        for label in labels {
-            all_step_logprobs.insert(label.clone(), Vec::new());
-        }
-        // Per-label resolved prefix length.
-        let mut resolved: HashMap<String, usize> = labels.iter().map(|l| (l.clone(), 0)).collect();
+        // 3. First constrained call over ALL labels.
+        let response = match self.backend.chat(messages, 0.0, Some(labels), true, k) {
+            Ok(r) => r,
+            Err(_) => {
+                return Self::empty_adaptive(labels, 0);
+            }
+        };
+        let mut calls_made: usize = 1;
 
-        let mut frontier: Vec<Cluster> = vec![Cluster {
-            labels: labels.to_vec(),
-            resolved_length: 0,
-        }];
-        let mut calls_made: usize = 0;
+        let winning_label = response.label.clone();
+        let step_logprobs =
+            extract_step_logprobs(response.logprobs.as_deref().unwrap_or_default(), &trie);
+
+        // Accumulate per-label logprobs and scored lengths for the initial
+        // call. All logprobs come from the same constraint context (all
+        // labels), so the distribution produced below is internally
+        // consistent.
+        let mut all_step_logprobs: HashMap<String, Vec<f64>> = HashMap::new();
+        let mut all_scored_lengths: HashMap<String, usize> = HashMap::new();
+        let initial_lengths = get_scored_lengths(&token_sequences, &winning_label);
+        for label in labels {
+            let scored_len = *initial_lengths.get(label).unwrap_or(&0);
+            let seq = token_sequences.get(label).cloned().unwrap_or_default();
+            let mut lps: Vec<f64> = Vec::with_capacity(scored_len);
+            for i in 0..scored_len {
+                let tok = seq.get(i).cloned().unwrap_or_default();
+                let lp = step_logprobs
+                    .get(i)
+                    .and_then(|m| m.get(&tok).copied())
+                    .unwrap_or(f64::NEG_INFINITY);
+                lps.push(lp);
+            }
+            all_step_logprobs.insert(label.clone(), lps);
+            all_scored_lengths.insert(label.clone(), scored_len);
+        }
+
+        // 4. Initial probability distribution (single constraint context).
+        let mut raw_scores: HashMap<String, f64> = HashMap::new();
+        for label in labels {
+            let lps = all_step_logprobs.get(label).cloned().unwrap_or_default();
+            let score = if lps.is_empty() {
+                f64::NEG_INFINITY
+            } else {
+                geometric_mean_logprob(&lps).unwrap_or(f64::NEG_INFINITY)
+            };
+            raw_scores.insert(label.clone(), score);
+        }
+        let mut probabilities = stable_softmax(&raw_scores).unwrap_or_default();
+
+        // 5. Recursive cluster resolution via reproportioning.
+        let mut frontier = identify_unresolved_clusters(&token_sequences, &all_scored_lengths);
 
         while !frontier.is_empty() && max_calls.is_none_or(|m| calls_made < m) {
             let cluster = frontier.remove(0);
+            let cluster_labels = &cluster.labels;
+
+            // Only resolve clusters with ≥2 labels. Singletons are already
+            // fixed: their probability is set by the between-group
+            // distribution and no reproportioning call would change it.
+            if cluster_labels.len() < 2 {
+                continue;
+            }
+
+            let cluster_response =
+                match self
+                    .backend
+                    .chat(messages, 0.0, Some(cluster_labels), true, k)
+                {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
             calls_made += 1;
 
-            let response = match self
-                .backend
-                .chat(messages, 0.0, Some(&cluster.labels), true, k)
-            {
-                Ok(r) => r,
-                Err(_) => break,
-            };
-            let winning_label = response.label.clone();
-            let step_logprobs =
-                extract_step_logprobs(response.logprobs.as_deref().unwrap_or_default(), &trie);
+            let cluster_winner = cluster_response.label.clone();
+            let cluster_step_lps = extract_step_logprobs(
+                cluster_response.logprobs.as_deref().unwrap_or_default(),
+                &trie,
+            );
 
-            // Score every label against the winning path up to its divergence point.
-            let scored_lengths = {
-                let mut m = HashMap::new();
-                for label in labels {
-                    let seq = token_sequences.get(label).cloned().unwrap_or_default();
-                    let win = token_sequences
-                        .get(&winning_label)
-                        .cloned()
-                        .unwrap_or_default();
-                    let dp = crate::scoring::divergence_point(&seq, &win);
-                    m.insert(label.clone(), dp);
-                }
-                m
-            };
-            let per_label_scores =
-                score_labels_from_winning_path(&token_sequences, &winning_label, &step_logprobs);
+            // Build the cluster's token sequences and score them.
+            let cluster_token_seqs: HashMap<String, Vec<String>> = cluster_labels
+                .iter()
+                .filter_map(|l| token_sequences.get(l).map(|s| (l.clone(), s.clone())))
+                .collect();
+            let sub_lengths = get_scored_lengths(&cluster_token_seqs, &cluster_winner);
 
-            // Append newly scored token logprobs for each label.
-            for label in labels {
-                let new_len = *scored_lengths.get(label).unwrap_or(&0);
-                let old_len = *resolved.get(label).unwrap_or(&0);
+            // Replace per-label logprobs for cluster members (NOT append —
+            // mixing logprobs from different constraint contexts corrupts the
+            // geometric mean). The replacement is only used to compute
+            // relative weights below.
+            for label in cluster_labels {
+                let new_len = *sub_lengths.get(label).unwrap_or(&0);
+                let old_len = *all_scored_lengths.get(label).unwrap_or(&0);
                 if new_len > old_len {
-                    // Recompute the per-position logprobs contributed for this label's
-                    // tokens on the winning path over [old_len, new_len).
                     let seq = token_sequences.get(label).cloned().unwrap_or_default();
-                    let bucket = all_step_logprobs.entry(label.clone()).or_default();
-                    for i in old_len..new_len {
+                    let mut new_lps: Vec<f64> = Vec::with_capacity(new_len);
+                    for i in 0..new_len {
                         let tok = seq.get(i).cloned().unwrap_or_default();
-                        let lp = step_logprobs
+                        let lp = cluster_step_lps
                             .get(i)
                             .and_then(|m| m.get(&tok).copied())
                             .unwrap_or(f64::NEG_INFINITY);
-                        bucket.push(lp);
+                        new_lps.push(lp);
                     }
-                    resolved.insert(label.clone(), new_len);
+                    all_step_logprobs.insert(label.clone(), new_lps);
+                    all_scored_lengths.insert(label.clone(), new_len);
                 }
-                // Record the label's overall score (used only for diagnostics; final
-                // scoring re-derives from all_step_logprobs).
-                let _ = per_label_scores.get(label);
             }
 
-            let unresolved = identify_unresolved_clusters(&token_sequences, &resolved);
-            frontier.extend(unresolved);
+            // Reproportion: redistribute the cluster's total probability mass
+            // among its members using softmax of geometric-mean scores. The
+            // sum of cluster probabilities is invariant; only within-cluster
+            // shares change.
+            let cluster_total: f64 = cluster_labels
+                .iter()
+                .filter_map(|l| probabilities.get(l).copied())
+                .sum();
+
+            let mut cluster_raw: HashMap<String, f64> = HashMap::new();
+            for label in cluster_labels {
+                let lps = all_step_logprobs.get(label).cloned().unwrap_or_default();
+                let score = if lps.is_empty() {
+                    f64::NEG_INFINITY
+                } else {
+                    geometric_mean_logprob(&lps).unwrap_or(f64::NEG_INFINITY)
+                };
+                cluster_raw.insert(label.clone(), score);
+            }
+            let cluster_weights = stable_softmax(&cluster_raw).unwrap_or_default();
+
+            for label in cluster_labels {
+                if let Some(w) = cluster_weights.get(label) {
+                    probabilities.insert(label.clone(), cluster_total * w);
+                }
+            }
+
+            // Identify sub-clusters within this cluster for further resolution.
+            let sub_clusters = identify_unresolved_clusters(&cluster_token_seqs, &sub_lengths);
+            frontier.extend(sub_clusters);
         }
 
-        // Final per-label scores + coverage from accumulated step logprobs.
-        let mut raw_scores: HashMap<String, f64> = HashMap::new();
+        // 6. Compute coverage and final values.
         let mut coverage: HashMap<String, f64> = HashMap::new();
         for label in labels {
-            let lps = all_step_logprobs.get(label).cloned().unwrap_or_default();
             let total = token_sequences.get(label).map(|s| s.len()).unwrap_or(0);
-            let score = geometric_mean_logprob(&lps).unwrap_or(f64::NEG_INFINITY);
-            raw_scores.insert(label.clone(), score);
+            let scored = *all_scored_lengths.get(label).unwrap_or(&0);
             let cov = if total == 0 {
-                0.0
+                1.0
             } else {
-                lps.len() as f64 / total as f64
+                scored as f64 / total as f64
             };
             coverage.insert(label.clone(), cov);
         }
-
-        let probabilities = stable_softmax(&raw_scores).unwrap_or_default();
+        let approximate = coverage.values().any(|&c| c < 1.0);
         let prediction = argmax(&probabilities).unwrap_or_default();
         let confidence = probabilities.get(&prediction).copied().unwrap_or(0.0);
-        let approximate = coverage.values().any(|&c| c < 1.0);
 
-        ClassificationResult::new_adaptive(
+        let mut result = ClassificationResult::new_adaptive(
             prediction,
             confidence,
             probabilities,
             coverage,
             calls_made as i64,
             approximate,
+        );
+        // Populate raw_response with the per-label diagnostics.
+        let raw = serde_json::json!({
+            "logprobs": raw_scores,
+            "token_sequences": token_sequences,
+            "step_logprobs": all_step_logprobs,
+            "scored_lengths": all_scored_lengths,
+        });
+        if let serde_json::Value::Object(map) = raw {
+            result.raw_response = map;
+        }
+        result
+    }
+
+    /// Fallback result when the initial constrained call fails entirely.
+    fn empty_adaptive(labels: &[String], calls_made: usize) -> ClassificationResult {
+        let n = labels.len() as f64;
+        let probabilities: HashMap<String, f64> =
+            labels.iter().map(|l| (l.clone(), 1.0 / n)).collect();
+        let coverage: HashMap<String, f64> = labels.iter().map(|l| (l.clone(), 0.0)).collect();
+        let prediction = labels.first().cloned().unwrap_or_default();
+        ClassificationResult::new_adaptive(
+            prediction,
+            1.0 / n,
+            probabilities,
+            coverage,
+            calls_made as i64,
+            true,
         )
     }
 
@@ -417,6 +559,7 @@ impl<B: LLMBackend> LLMClassifier<B> {
             let (system, user) = build_classification_prompt(text, &choices, sp.as_deref());
             let messages = Self::to_messages(&system, &user);
             let mut raw_scores: HashMap<String, f64> = HashMap::new();
+            let mut logprob_details: HashMap<String, Vec<f64>> = HashMap::new();
             for label in &labels {
                 let lps = match this.backend.score(&messages, label) {
                     Ok(resp) => resp.logprobs.iter().map(|t| t.logprob).collect::<Vec<_>>(),
@@ -426,8 +569,9 @@ impl<B: LLMBackend> LLMClassifier<B> {
                     label.clone(),
                     geometric_mean_logprob(&lps).unwrap_or(f64::NEG_INFINITY),
                 );
+                logprob_details.insert(label.clone(), lps);
             }
-            Ok(this.finalize_multi_call(raw_scores, labels.len()))
+            Ok(this.finalize_multi_call(raw_scores, logprob_details, labels.len()))
         })
     }
 
